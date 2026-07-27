@@ -1,0 +1,32 @@
+# Environment variables
+.env
+*.env
+
+# Python Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# SQLite Databases & Storage
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+tripcaspian.db
+
+# Cache & Build Artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.pytest_tmp/
+*.egg-info/
+dist/
+build/
+
+# OAuth & Credentials
+uber_credentials.json
+*.pem
+*.key
