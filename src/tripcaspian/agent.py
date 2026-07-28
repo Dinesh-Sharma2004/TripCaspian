@@ -73,11 +73,14 @@ def main():
     # Connect Telegram Bot channel
     try:
         conn = client.connect_telegram(bot_token=telegram_token)
-        bot_addr = conn.get("address", "@tripcaspian_bot")
+        bot_addr = conn.get("address", "@tripiss_bot")
         print(f"[OK] Telegram connected ({bot_addr})")
     except Exception as e:
-        print(f"[ERROR] Failed to connect Telegram bot: {e}")
-        sys.exit(1)
+        if "409" in str(e) or "already connected" in str(e):
+            print(f"[OK] Telegram bot already connected to Caspian Gateway")
+        else:
+            print(f"[ERROR] Failed to connect Telegram bot: {e}")
+            sys.exit(1)
 
     # Optional Email Connection
     email_user = os.environ.get("EMAIL_USERNAME", "tripcaspian")
