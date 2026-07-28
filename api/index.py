@@ -4,24 +4,40 @@ import os
 import json
 import logging
 from http.server import BaseHTTPRequestHandler
-from caspian_sdk import CommClient
-from tripcaspian.service import TripService
-from tripcaspian.storage import SQLiteStorage
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("tripcaspian_vercel")
 
-# Initialize persistent instances at module scope for serverless reuse
-client = CommClient()
-storage = SQLiteStorage(db_path="/tmp/tripcaspian.db")
-service = TripService(storage=storage, caspian_client=client)
+_service = None
+_client = None
+
+
+def get_service_and_client():
+    """Lazy initialization helper to prevent module-level cold-start crashes."""
+    global _service, _client
+    if _service is None:
+        from tripcaspian.service import TripService
+        from tripcaspian.storage import SQLiteStorage
+
+        storage = SQLiteStorage(db_path="/tmp/tripcaspian.db")
+
+        try:
+            from caspian_sdk import CommClient
+            _client = CommClient()
+            _service = TripService(storage=storage, caspian_client=_client)
+        except Exception as err:
+            logger.warning("CommClient lazy initialization warning: %s", err)
+            _service = TripService(storage=storage)
+
+    return _service, _client
 
 
 class handler(BaseHTTPRequestHandler):
     """Vercel Python Serverless HTTP Request Handler."""
 
     def do_GET(self):
+        """Healthcheck endpoint for Vercel deployment."""
         self.send_response(200)
         self.send_header("Content-type", "application/json")
         self.end_headers()
@@ -30,15 +46,16 @@ class handler(BaseHTTPRequestHandler):
             "status": "online",
             "service": "TripCaspian AI Agent",
             "version": "0.1.0",
-            "telegram_bot": "@tripcaspian_bot",
+            "telegram_bot": "@tripiss_bot",
             "channels": ["telegram", "discord", "email"],
             "providers": ["IRCTC Train", "redBus Bus", "Uber Cab"],
         }
         self.wfile.write(json.dumps(response, indent=2).encode("utf-8"))
 
     def do_POST(self):
+        """Receive and process Caspian Gateway Webhook events."""
         content_length = int(self.headers.get("Content-Length", 0))
-        post_data = self.rfile.read(content_length).decode("utf-8")
+        post_data = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else ""
 
         try:
             event = json.loads(post_data) if post_data else {}
@@ -64,9 +81,10 @@ class handler(BaseHTTPRequestHandler):
                 )
 
                 if text:
+                    service, client = get_service_and_client()
                     reply = service.handle_user_message(conv_id, sender, text)
 
-                    if msg_id:
+                    if msg_id and client:
                         try:
                             client.reply(msg_id, text=reply)
                             logger.info("Reply sent via Caspian REST API for msg_id=%s", msg_id)
