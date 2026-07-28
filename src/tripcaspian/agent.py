@@ -34,7 +34,7 @@ def validate_environment() -> tuple[str, str]:
     telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not telegram_token:
         print("\n❌ Error: TELEGRAM_BOT_TOKEN is missing in .env")
-        print("   Fix: Add TELEGRAM_BOT_TOKEN=8912992717:AAGrpWx0Jya1KCJubl-KDclxFoggU8R3ZJs to .env\n")
+        print("   Fix: Add TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here to .env\n")
         sys.exit(1)
 
     return caspian_key, telegram_token

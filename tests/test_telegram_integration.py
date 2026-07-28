@@ -19,8 +19,9 @@ load_dotenv(env_path, override=True)
 
 def test_telegram_bot_token_validity():
     """Verify Telegram bot token format and network endpoint."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN") or "8912992717:AAGrpWx0Jya1KCJubl-KDclxFoggU8R3ZJs"
-    assert token, "TELEGRAM_BOT_TOKEN is not set in environment"
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        pytest.skip("TELEGRAM_BOT_TOKEN not set in environment")
 
     try:
         resp = httpx.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10.0)
@@ -35,7 +36,7 @@ def test_telegram_conversation_flow(tmp_path):
     storage = SQLiteStorage(db_path=db_file)
     service = TripService(storage=storage)
 
-    telegram_conv_id = "telegram_chat_8912992717"
+    telegram_conv_id = "telegram_chat_test_12345"
     sender = {"address": "@traveler_user", "channel": "telegram"}
 
     # Turn 1: User sends travel request
