@@ -51,10 +51,11 @@ def rank_route_options(
     options: list[RouteOption],
     budget: float,
     custom_concession: float | None = None,
+    max_travel_time_hours: float | None = None,
     w_price: float = DEFAULT_W_PRICE,
     w_time: float = DEFAULT_W_TIME,
 ) -> tuple[list[RankedOption], float, bool]:
-    """Rank route options applying weighted scoring and budget concession widening.
+    """Rank route options applying weighted scoring, travel duration constraints, and budget concessions.
 
     Returns:
         (ranked_options_list, effective_budget_cutoff, is_widened)
@@ -89,14 +90,14 @@ def rank_route_options(
     # Compute normalized scores for eligible items
     scores = score_options(eligible, w_price=w_price, w_time=w_time)
 
-    # Deterministic sort key:
-    # 1. score (ascending)
-    # 2. price (ascending)
-    # 3. duration_minutes (ascending)
-    # 4. depart (alphabetical/time string)
-    # 5. operator (alphabetical)
+    # Convert max_travel_time_hours to minutes limit if provided
+    max_duration_mins = (max_travel_time_hours * 60.0) if max_travel_time_hours else None
+
+    # Sort key taking travel duration limit, normalized score, price, and duration into account
     def sort_key(opt: RouteOption):
+        exceeds_time_limit = 1 if (max_duration_mins and opt.duration_minutes > max_duration_mins) else 0
         return (
+            exceeds_time_limit,
             scores.get(opt.id, 1.0),
             opt.price,
             opt.duration_minutes,
@@ -118,14 +119,10 @@ def rank_route_options(
             reasons.append("Cheapest option")
         if opt.id == min_time_opt.id:
             reasons.append("Fastest route")
+        if max_duration_mins and opt.duration_minutes <= max_duration_mins:
+            reasons.append(f"Within {max_travel_time_hours:.1f}h travel limit")
 
-        if opt.price > budget:
-            pct_over = round(((opt.price - budget) / budget) * 100, 1)
-            reasons.append(f"{pct_over}% over target budget (within concession)")
-        elif not reasons:
-            reasons.append("Best overall value within budget")
-
-        reason_str = " | ".join(reasons)
+        reason_str = ", ".join(reasons) if reasons else "Good balance of price & time"
         ranked_results.append(RankedOption(option=opt, score=score, reason=reason_str))
 
     return ranked_results, effective_cutoff, is_widened

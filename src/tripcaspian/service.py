@@ -113,9 +113,12 @@ class TripService:
         if not all_options:
             return f"Sorry, no routes could be found for {source} ➡️ {destination}."
 
-        # Rank using Optimizer with budget concession logic
+        # Rank using Optimizer with budget concession & travel time constraints
         ranked, cutoff, is_widened = rank_route_options(
-            all_options, budget=budget, custom_concession=query.concession_pct
+            all_options,
+            budget=budget,
+            custom_concession=query.concession_pct,
+            max_travel_time_hours=query.max_travel_time_hours,
         )
 
         if not ranked:
@@ -166,7 +169,12 @@ class TripService:
         for provider in self.providers:
             all_options.extend(provider.search(query.source or "", query.destination or ""))
 
-        ranked, _, _ = rank_route_options(all_options, budget=query.budget or 10000.0)
+        ranked, _, _ = rank_route_options(
+            all_options,
+            budget=query.budget or 10000.0,
+            custom_concession=query.concession_pct,
+            max_travel_time_hours=query.max_travel_time_hours,
+        )
 
         if not ranked or opt_num > len(ranked):
             return f"Option {opt_num} is invalid. Please select from option 1 to {len(ranked)}."

@@ -29,7 +29,7 @@ def test_partial_query_triggers_single_followup():
     assert query.is_complete() is False
 
     followup = generate_followup_question(query)
-    assert followup == "Understood! What is your maximum budget for the trip from Delhi to Jaipur?"
+    assert followup == "Understood! What is your maximum budget and preferred departure/travel duration limit for the trip from Delhi to Jaipur? (e.g. ₹1200, tomorrow morning, under 6 hours)"
 
 
 def test_preserving_existing_fields():

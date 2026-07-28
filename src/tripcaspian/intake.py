@@ -17,6 +17,7 @@ class TripQuery:
     source: str | None = None
     destination: str | None = None
     depart_time: str | None = None
+    max_travel_time_hours: float | None = None
     budget: float | None = None
     concession_pct: float | None = None
 
@@ -43,6 +44,7 @@ def parse_trip_request(
     source = base.get("source")
     destination = base.get("destination")
     depart_time = base.get("depart_time")
+    max_travel_time_hours = base.get("max_travel_time_hours")
     budget = base.get("budget")
     concession_pct = base.get("concession_pct")
 
@@ -118,10 +120,29 @@ def parse_trip_request(
     if time_match and not depart_time:
         depart_time = time_match.group(1).strip()
 
+    # Maximum Travel Duration Extraction (e.g. "under 6 hours", "max 5 hrs travel time", "duration under 8h")
+    duration_match = re.search(
+        r'(?:under|max|within|less than|travel time under|duration under|take at most)\s*([0-9.]+)\s*(?:hours?|hrs?|h)\b',
+        clean_text,
+        re.IGNORECASE,
+    )
+    if not duration_match:
+        duration_match = re.search(
+            r'([0-9.]+)\s*(?:hours?|hrs?|h)\s*(?:max|travel time|duration|limit)',
+            clean_text,
+            re.IGNORECASE,
+        )
+    if duration_match and not max_travel_time_hours:
+        try:
+            max_travel_time_hours = float(duration_match.group(1))
+        except ValueError:
+            pass
+
     return TripQuery(
         source=source,
         destination=destination,
         depart_time=depart_time,
+        max_travel_time_hours=max_travel_time_hours,
         budget=budget,
         concession_pct=concession_pct,
     )
@@ -129,7 +150,6 @@ def parse_trip_request(
 
 def generate_followup_question(query: TripQuery) -> str | None:
     """Generate a single targeted follow-up question for missing required fields."""
-    missing = []
     if not query.source and not query.destination:
         return "Where are you traveling from and to? (e.g. Delhi to Jaipur)"
     if not query.source:
@@ -137,6 +157,6 @@ def generate_followup_question(query: TripQuery) -> str | None:
     if not query.destination:
         return f"Got it, starting from {query.source}! Where is your destination?"
     if query.budget is None:
-        return f"Understood! What is your maximum budget for the trip from {query.source} to {query.destination}?"
+        return f"Understood! What is your maximum budget and preferred departure/travel duration limit for the trip from {query.source} to {query.destination}? (e.g. ₹1200, tomorrow morning, under 6 hours)"
 
     return None
