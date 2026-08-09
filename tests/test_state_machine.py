@@ -36,7 +36,7 @@ def test_resolver_correctness_and_duplicate_prevention(tmp_path):
         channel="telegram"
     )
     assert r1 is not None
-    assert "New Commitment Detected" in r1
+    assert "Arjun is supposed to pay" in r1
     
     commitments = storage.get_unresolved_commitments(conv_id)
     assert len(commitments) == 1
@@ -97,7 +97,68 @@ def test_resolver_correctness_and_duplicate_prevention(tmp_path):
         channel="telegram"
     )
     assert r4 is not None
-    assert "New Commitment Detected" in r4
+    assert "is supposed to send" in r4
     
     all_unresolved = storage.get_unresolved_commitments(conv_id)
     assert len(all_unresolved) == 2  # The payment one (fulfillment_claimed) and the document one (pending)
+
+
+def test_resolution_ambiguity_triggers_llm(tmp_path, monkeypatch):
+    from bizpulse.storage import SQLiteStorage
+    from bizpulse.service import BizPulseService
+
+    db_file = str(tmp_path / "test_ambiguity.db")
+    storage = SQLiteStorage(db_path=db_file)
+    service = BizPulseService(storage=storage)
+
+    conv_id = "ambiguity_chat"
+
+    # Create two unresolved commitments in the same conversation
+    # C1: Arjun / Delta Traders / ₹42,000 / Friday
+    service.handle_user_message(
+        conversation_id=conv_id,
+        sender={"address": "@owner"},
+        text="/create payment | Arjun | Delta Traders | 42000 | Friday",
+        message_id="msg_001",
+        channel="telegram"
+    )
+    # C2: Arjun / Delta Traders / ₹15,000 / Friday
+    service.handle_user_message(
+        conversation_id=conv_id,
+        sender={"address": "@owner"},
+        text="/create payment | Arjun | Delta Traders | 15000 | Friday",
+        message_id="msg_002",
+        channel="telegram"
+    )
+
+    unresolved = storage.get_unresolved_commitments(conv_id)
+    assert len(unresolved) == 2
+    c2, c1 = unresolved[0], unresolved[1] # SQLite returns ordered by updated_at DESC
+
+    # Mock the LLM ambiguity resolution function to return c2's ID
+    called_with_candidates = []
+    def mock_resolve_ambiguity(text, candidates):
+        called_with_candidates.extend(candidates)
+        return c2.id
+    monkeypatch.setattr("bizpulse.commitments.extractor.resolve_ambiguity_via_gemini", mock_resolve_ambiguity)
+
+    # Process ambiguous message "Actually, make that Monday."
+    r = service.handle_user_message(
+        conversation_id=conv_id,
+        sender={"address": "@arjun_user", "channel": "telegram"},
+        text="Actually, make that Monday.",
+        message_id="msg_003",
+        channel="telegram"
+    )
+
+    assert r is not None
+    assert len(called_with_candidates) == 2  # Verify ambiguity handler was called with both candidates
+    
+    # Check that C2 got rescheduled to Monday, while C1 remains Friday
+    c2_updated = storage.get_commitment(c2.id)
+    assert c2_updated.status == "rescheduled"
+    assert c2_updated.deadline_raw == "monday"
+
+    c1_updated = storage.get_commitment(c1.id)
+    assert c1_updated.status == "pending"
+    assert c1_updated.deadline_raw == "Friday"

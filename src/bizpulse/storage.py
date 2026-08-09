@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import logging
 from typing import Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from bizpulse.commitments.models import Commitment
 from bizpulse.config import DATABASE_PATH
@@ -22,11 +22,11 @@ DB_LOCKS: dict[str, threading.Lock] = {}
 GLOBAL_LOCK = threading.Lock()
 
 
-def get_conversation_lock(conversation_id: str) -> threading.Lock:
+def get_conversation_lock(conversation_id: str) -> threading.RLock:
     """Get or create a thread lock specific to a conversation ID."""
     with GLOBAL_LOCK:
         if conversation_id not in DB_LOCKS:
-            DB_LOCKS[conversation_id] = threading.Lock()
+            DB_LOCKS[conversation_id] = threading.RLock()
         return DB_LOCKS[conversation_id]
 
 
@@ -76,11 +76,63 @@ class SQLiteStorage:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     last_followup_at TEXT,
+                    next_followup_at TEXT,
+                    extraction_method TEXT,
                     followup_count INTEGER DEFAULT 0,
                     confidence REAL,
                     active_job_id TEXT
                 );
             """)
+            
+            # Create drafts table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS drafts (
+                    conversation_id TEXT PRIMARY KEY,
+                    party TEXT,
+                    organization TEXT,
+                    type TEXT,
+                    action TEXT,
+                    object TEXT,
+                    amount_cents INTEGER,
+                    currency TEXT,
+                    deadline_utc TEXT,
+                    deadline_raw TEXT,
+                    intent TEXT,
+                    source_message_id TEXT,
+                    source_channel TEXT,
+                    source_text TEXT,
+                    missing_field TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # Create onboarding_status table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS onboarding_status (
+                    conversation_id TEXT PRIMARY KEY,
+                    onboarding_sent INTEGER DEFAULT 0
+                );
+            """)
+
+            # Create low_signal_states table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS low_signal_states (
+                    conversation_id TEXT PRIMARY KEY,
+                    low_signal_count INTEGER DEFAULT 0,
+                    last_low_signal_at TEXT,
+                    clarification_topic TEXT,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+            # Dynamic migration for existing databases
+            cursor = conn.execute("PRAGMA table_info(commitments);")
+            columns = [row["name"] for row in cursor.fetchall()]
+            if "next_followup_at" not in columns:
+                conn.execute("ALTER TABLE commitments ADD COLUMN next_followup_at TEXT;")
+            if "extraction_method" not in columns:
+                conn.execute("ALTER TABLE commitments ADD COLUMN extraction_method TEXT;")
             
             # Dropped the sessions and watch_subscriptions tables
             conn.execute("DROP TABLE IF EXISTS sessions;")
@@ -99,14 +151,14 @@ class SQLiteStorage:
                         id, conversation_id, party, organization, type, action, object,
                         amount_cents, residual_cents, currency, deadline_utc, deadline_raw,
                         timezone, status, source_message_id, source_channel, source_text,
-                        notes, created_at, updated_at, last_followup_at, followup_count,
-                        confidence, active_job_id
+                        notes, created_at, updated_at, last_followup_at, next_followup_at,
+                        extraction_method, followup_count, confidence, active_job_id
                     ) VALUES (
                         :id, :conversation_id, :party, :organization, :type, :action, :object,
                         :amount_cents, :residual_cents, :currency, :deadline_utc, :deadline_raw,
                         :timezone, :status, :source_message_id, :source_channel, :source_text,
-                        :notes, :created_at, :updated_at, :last_followup_at, :followup_count,
-                        :confidence, :active_job_id
+                        :notes, :created_at, :updated_at, :last_followup_at, :next_followup_at,
+                        :extraction_method, :followup_count, :confidence, :active_job_id
                     )
                     ON CONFLICT(id) DO UPDATE SET
                         conversation_id = excluded.conversation_id,
@@ -128,6 +180,8 @@ class SQLiteStorage:
                         notes = excluded.notes,
                         updated_at = excluded.updated_at,
                         last_followup_at = excluded.last_followup_at,
+                        next_followup_at = excluded.next_followup_at,
+                        extraction_method = excluded.extraction_method,
                         followup_count = excluded.followup_count,
                         confidence = excluded.confidence,
                         active_job_id = excluded.active_job_id;
@@ -172,3 +226,149 @@ class SQLiteStorage:
         conn = self._get_connection()
         with conn:
             conn.execute("DELETE FROM commitments WHERE id = ?", (commitment_id,))
+
+    def save_draft(self, draft: dict[str, Any]) -> None:
+        """Save or update a commitment draft in persistent storage."""
+        lock = get_conversation_lock(draft["conversation_id"])
+        with lock:
+            conn = self._get_connection()
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO drafts (
+                        conversation_id, party, organization, type, action, object,
+                        amount_cents, currency, deadline_utc, deadline_raw, intent,
+                        source_message_id, source_channel, source_text, missing_field,
+                        updated_at
+                    ) VALUES (
+                        :conversation_id, :party, :organization, :type, :action, :object,
+                        :amount_cents, :currency, :deadline_utc, :deadline_raw, :intent,
+                        :source_message_id, :source_channel, :source_text, :missing_field,
+                        CURRENT_TIMESTAMP
+                    )
+                    ON CONFLICT(conversation_id) DO UPDATE SET
+                        party = excluded.party,
+                        organization = excluded.organization,
+                        type = excluded.type,
+                        action = excluded.action,
+                        object = excluded.object,
+                        amount_cents = excluded.amount_cents,
+                        currency = excluded.currency,
+                        deadline_utc = excluded.deadline_utc,
+                        deadline_raw = excluded.deadline_raw,
+                        intent = excluded.intent,
+                        source_message_id = excluded.source_message_id,
+                        source_channel = excluded.source_channel,
+                        source_text = excluded.source_text,
+                        missing_field = excluded.missing_field,
+                        updated_at = CURRENT_TIMESTAMP;
+                    """,
+                    draft,
+                )
+
+    def get_draft(self, conversation_id: str) -> dict[str, Any] | None:
+        """Retrieve a draft by conversation ID."""
+        lock = get_conversation_lock(conversation_id)
+        with lock:
+            conn = self._get_connection()
+            cursor = conn.execute("SELECT * FROM drafts WHERE conversation_id = ?", (conversation_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return dict(row)
+
+    def delete_draft(self, conversation_id: str) -> None:
+        """Delete a draft by conversation ID."""
+        lock = get_conversation_lock(conversation_id)
+        with lock:
+            conn = self._get_connection()
+            with conn:
+                conn.execute("DELETE FROM drafts WHERE conversation_id = ?", (conversation_id,))
+
+    def has_sent_onboarding(self, conversation_id: str) -> bool:
+        """Check if onboarding was already sent in this conversation."""
+        lock = get_conversation_lock(conversation_id)
+        with lock:
+            conn = self._get_connection()
+            cursor = conn.execute(
+                "SELECT onboarding_sent FROM onboarding_status WHERE conversation_id = ?",
+                (conversation_id,)
+            )
+            row = cursor.fetchone()
+            return bool(row and row["onboarding_sent"])
+
+    def mark_onboarding_sent(self, conversation_id: str) -> None:
+        """Mark onboarding as sent for this conversation."""
+        lock = get_conversation_lock(conversation_id)
+        with lock:
+            conn = self._get_connection()
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO onboarding_status (conversation_id, onboarding_sent)
+                    VALUES (?, 1)
+                    ON CONFLICT(conversation_id) DO UPDATE SET onboarding_sent = 1
+                    """,
+                    (conversation_id,)
+                )
+
+    def get_low_signal_state(self, conversation_id: str) -> dict[str, Any]:
+        """Retrieve low signal state for a specific conversation ID."""
+        lock = get_conversation_lock(conversation_id)
+        with lock:
+            conn = self._get_connection()
+            cursor = conn.execute(
+                "SELECT low_signal_count, last_low_signal_at, clarification_topic FROM low_signal_states WHERE conversation_id = ?",
+                (conversation_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return {"low_signal_count": 0, "last_low_signal_at": None, "clarification_topic": None}
+            
+            last_at_str = row["last_low_signal_at"]
+            if last_at_str:
+                try:
+                    last_at = datetime.fromisoformat(last_at_str)
+                    if (datetime.now(timezone.utc) - last_at).total_seconds() > 3600:
+                        conn.execute("DELETE FROM low_signal_states WHERE conversation_id = ?", (conversation_id,))
+                        return {"low_signal_count": 0, "last_low_signal_at": None, "clarification_topic": None}
+                except Exception:
+                    pass
+            
+            return {
+                "low_signal_count": row["low_signal_count"],
+                "last_low_signal_at": row["last_low_signal_at"],
+                "clarification_topic": row["clarification_topic"]
+            }
+
+    def increment_low_signal_count(self, conversation_id: str, topic: str = None) -> int:
+        """Increment low signal count and update last timestamp and topic."""
+        lock = get_conversation_lock(conversation_id)
+        with lock:
+            state = self.get_low_signal_state(conversation_id)
+            new_count = state["low_signal_count"] + 1
+            now_str = datetime.now(timezone.utc).isoformat()
+            
+            conn = self._get_connection()
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO low_signal_states (conversation_id, low_signal_count, last_low_signal_at, clarification_topic, updated_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(conversation_id) DO UPDATE SET
+                        low_signal_count = excluded.low_signal_count,
+                        last_low_signal_at = excluded.last_low_signal_at,
+                        clarification_topic = excluded.clarification_topic,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (conversation_id, new_count, now_str, topic)
+                )
+            return new_count
+
+    def reset_low_signal_count(self, conversation_id: str) -> None:
+        """Reset/delete low signal count state."""
+        lock = get_conversation_lock(conversation_id)
+        with lock:
+            conn = self._get_connection()
+            with conn:
+                conn.execute("DELETE FROM low_signal_states WHERE conversation_id = ?", (conversation_id,))

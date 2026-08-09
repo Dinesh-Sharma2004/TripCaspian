@@ -71,13 +71,24 @@ def resolve_commitment(
         return None, "none"
 
     # Heuristic shortcut: if same conversation, same party, and exactly 1 unresolved commitment,
-    # resolve directly to it for reschedule/fulfillment/dispute.
+    # resolve directly to it if concrete safety signal is met.
     if intent in ("reschedule", "fulfillment", "dispute") and len(unresolved_commitments) == 1:
         existing = unresolved_commitments[0]
+        gate_score = candidate.get("gate_score", 0)
         c_party = (candidate.get("party") or "").strip().lower()
         e_party = (existing.party or "").strip().lower()
-        if c_party and e_party and (c_party in e_party or e_party in c_party or c_party == "counterparty"):
-            logger.info("Local shortcut match: matching to commitment %s", existing.id)
+        
+        party_matched = c_party and e_party and (c_party in e_party or e_party in c_party) and (c_party != "counterparty")
+        
+        c_amount = candidate.get("amount_cents")
+        amount_matched = False
+        if c_amount is not None and existing.amount_cents is not None and existing.amount_cents > 0:
+            diff = abs(c_amount - existing.amount_cents)
+            if diff <= (0.10 * existing.amount_cents):
+                amount_matched = True
+                
+        if gate_score >= 4 or party_matched or amount_matched:
+            logger.info("Deterministic local shortcut: matching to single unresolved commitment %s", existing.id)
             return existing, "update"
 
     # Standard entity matching scoring
@@ -97,7 +108,6 @@ def resolve_commitment(
         for existing in unresolved_commitments:
             # If same party, amount, and deadline already exists, treat as duplicate (ignore)
             c_amount = candidate.get("amount_cents")
-            c_deadline = candidate.get("deadline_utc")
             if (existing.party.lower() == (candidate.get("party") or "").lower() and
                     existing.amount_cents == c_amount and
                     existing.deadline_raw == candidate.get("deadline_raw")):
@@ -135,7 +145,8 @@ def resolve_commitment(
             notes=None,
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
-            confidence=candidate.get("confidence", 1.0)
+            confidence=candidate.get("confidence", 1.0),
+            extraction_method=candidate.get("extraction_method", "offline")
         )
         return new_commitment, "create"
 
@@ -143,6 +154,17 @@ def resolve_commitment(
         if best_match and best_score >= 5:
             return best_match, "update"
         else:
+            # Genuinely ambiguous: call LLM ambiguity resolution if multiple commitments exist
+            if len(unresolved_commitments) > 1:
+                logger.info("Resolver ambiguity detected. Invoking Gemini resolution.")
+                from bizpulse.commitments.extractor import resolve_ambiguity_via_gemini
+                matched_id = resolve_ambiguity_via_gemini(source_text, unresolved_commitments)
+                if matched_id:
+                    for c in unresolved_commitments:
+                        if c.id == matched_id:
+                            logger.info("Ambiguity successfully resolved to: %s", c.id)
+                            return c, "update"
+            
             logger.warning(
                 "Unresolved match for intent '%s' (best score %d < 5). Logging warning.",
                 intent, best_score

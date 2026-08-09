@@ -84,6 +84,15 @@ def main():
     except Exception as e:
         logger.debug("Email connection notice: %s", e)
 
+    # Optional Discord Connection
+    discord_token = os.environ.get("DISCORD_BOT_TOKEN")
+    if discord_token:
+        try:
+            client.connect_discord(bot_token=discord_token)
+            print(f"[OK] Discord connected")
+        except Exception as e:
+            logger.debug("Discord connection notice: %s", e)
+
     # Start Watcher daemon thread BEFORE calling blocking client.listen()
     watcher.start_daemon(client=client)
     print("[OK] Watcher daemon started")

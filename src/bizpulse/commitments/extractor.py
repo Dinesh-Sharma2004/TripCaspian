@@ -31,6 +31,34 @@ def _parseable_utc(val: str) -> bool:
     return False
 
 
+def extract_amount_from_text(lower_text: str) -> tuple[int | None, str | None]:
+    """Helper to robustly parse monetary amounts from text."""
+    # 1. Standard patterns (currency symbol prefix)
+    money_prefix_match = re.search(r'\b(?:₹|rs\.?|inr|usd|\$)\s*([0-9,]+)\b', lower_text)
+    if money_prefix_match:
+        val = int(money_prefix_match.group(1).replace(",", ""))
+        currency = "INR" if any(c in lower_text for c in ["₹", "rs", "inr"]) else "USD"
+        return val * 100, currency
+
+    # 2. Suffix patterns (e.g. "42,000 rupees")
+    money_suffix_match = re.search(r'\b([0-9,]+)\s*(?:rupees|inr|usd|dollars|euros)\b', lower_text)
+    if money_suffix_match:
+        val = int(money_suffix_match.group(1).replace(",", ""))
+        currency = "INR" if any(c in lower_text for c in ["rupees", "inr"]) else "USD"
+        return val * 100, currency
+
+    # 3. Bare numbers (e.g. "42000" or "42,000"), ONLY if context indicates payment and not quantity
+    bare_number_match = re.search(r'\b\d{1,3}(?:,\d{3})+\b|\b\d{3,}\b', lower_text)
+    if bare_number_match:
+        is_payment_context = any(w in lower_text for w in ["pay", "paid", "payment", "owes", "owe", "bill", "invoice", "rupees", "inr"])
+        has_quantity_clue = any(w in lower_text for w in ["units", "documents", "copies", "items", "boxes", "packages", "pieces", "pcs", "documents", "files"])
+        if is_payment_context and not has_quantity_clue:
+            val = int(bare_number_match.group(0).replace(",", ""))
+            return val * 100, "INR"
+
+    return None, None
+
+
 def validate_extraction(result: dict[str, Any]) -> str:
     """Validate extraction results against schemas and structural requirements."""
     if not result.get('has_commitment'):
@@ -84,6 +112,14 @@ def extract_offline(text: str, now_utc: datetime.datetime, tz_name: str) -> dict
     """Fallback rule-based commitment extractor."""
     lower_text = text.lower()
     
+    # 0. Request/Directionality check: questions or requests to the receiver are not speaker commitments
+    is_request = False
+    if "?" in lower_text:
+        is_request = True
+    if any(p in lower_text for p in ["can you", "could you", "please send", "please deliver", "please provide", "please pay"]):
+        if not any(p in lower_text for p in ["i will", "i'll", "we will", "we'll"]):
+            is_request = True
+            
     res = {
         "has_commitment": False,
         "intent": "irrelevant",
@@ -96,8 +132,12 @@ def extract_offline(text: str, now_utc: datetime.datetime, tz_name: str) -> dict
         "currency": None,
         "deadline_utc": None,
         "deadline_raw": None,
-        "confidence": 1.0
+        "confidence": 1.0,
+        "extraction_method": "offline"
     }
+    
+    if is_request:
+        return res
     
     # 1. Dispute detection
     if any(phrase in lower_text for phrase in ["never said", "dispute", "didn't say", "not what i promised"]):
@@ -140,21 +180,37 @@ def extract_offline(text: str, now_utc: datetime.datetime, tz_name: str) -> dict
         return res
 
     # 4. New commitment extraction (e.g. Arjun from Delta Traders says...)
-    money_match = re.search(r'(?:₹|rs\.?|inr|usd|\$)\s*([0-9,]+)', lower_text)
-    if money_match or any(day in lower_text for day in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "tomorrow", "next week"]):
+    amount_cents, currency = extract_amount_from_text(lower_text)
+    has_date = any(day in lower_text for day in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "tomorrow", "next week"])
+    if (amount_cents is not None) or has_date:
         res["has_commitment"] = True
         res["intent"] = "new"
-        res["type"] = "payment" if (money_match or "pay" in lower_text) else "delivery"
-        res["action"] = "pay" if res["type"] == "payment" else "deliver"
-        res["object"] = "money" if res["type"] == "payment" else "goods"
         
-        if money_match:
-            val = int(money_match.group(1).replace(",", ""))
-            res["amount_cents"] = val * 100
-            res["currency"] = "INR" if any(c in lower_text for c in ["₹", "rs", "inr"]) else "USD"
+        # Check document clues
+        doc_match = re.search(r'\b(send|provide)\s+(.*?)\s+(?:friday|monday|tuesday|wednesday|thursday|saturday|sunday|tomorrow|next week|today|by)', lower_text)
+        if doc_match:
+            res["type"] = "document"
+            res["action"] = "send"
+            res["object"] = doc_match.group(2).strip()
+        else:
+            res["type"] = "payment" if (amount_cents is not None or "pay" in lower_text) else "delivery"
+            res["action"] = "pay" if res["type"] == "payment" else "deliver"
+            if res["type"] == "payment":
+                res["object"] = "money"
+            else:
+                # Extract object for delivery
+                obj_match = re.search(r'\bdeliver\s+(.*?)\s+(?:friday|monday|tuesday|wednesday|thursday|saturday|sunday|tomorrow|next week|today|by)', lower_text)
+                if obj_match:
+                    res["object"] = obj_match.group(1).strip()
+                else:
+                    res["object"] = "goods"
+        
+        if amount_cents is not None:
+            res["amount_cents"] = amount_cents
+            res["currency"] = currency
         
         # Look for party / org
-        party_match = re.search(r'\b(arjun)\b', lower_text)
+        party_match = re.search(r'\b(arjun|supplier|customer|client|vendor)\b', lower_text)
         res["party"] = party_match.group(1).title() if party_match else "Counterparty"
         
         org_match = re.search(r'\b(delta traders)\b', lower_text)
@@ -175,9 +231,13 @@ def extract_offline(text: str, now_utc: datetime.datetime, tz_name: str) -> dict
 
 def extract_commitment(text: str, now_utc: datetime.datetime, tz_name: str = DEFAULT_TIMEZONE) -> dict[str, Any]:
     """Extract commitment parameters from normalized message using Gemini API or offline fallback."""
+    import bizpulse.metrics as metrics
+    
     if not GEMINI_API_KEY:
         logger.info("GEMINI_API_KEY is not set. Falling back to rule-based offline extractor.")
-        return extract_offline(text, now_utc, tz_name)
+        res = extract_offline(text, now_utc, tz_name)
+        res["extraction_method"] = "offline"
+        return res
 
     now_iso = now_utc.isoformat()
     system_prompt = f"""Extract business obligations from the message below.
@@ -202,12 +262,15 @@ Return JSON only — no prose, no markdown.
 }}
 
 Rules:
-- "I will..." may be a commitment. "I hope..." is not.
+- Extract only business obligations.
+- Relative deadlines must use the supplied current time and timezone.
 - A reply does not prove fulfillment.
-- Resolve relative dates to absolute UTC using the Now timestamp and timezone info. E.g. "by Friday" at Thursday 11:00 PM IST is calculated to Friday EOD (23:59) in Asia/Kolkata, then converted to UTC.
-- intent=reschedule if modifying an existing obligation.
-- intent=fulfillment if claiming completion.
-- If has_commitment=false, return null for all other fields.
+- "I'll..." can indicate a commitment.
+- "Maybe..." or "I hope..." is not automatically a commitment.
+- Rescheduling modifies an existing obligation.
+- Fulfillment means a claim of completion, not verified completion.
+- Dispute means the obligation is denied or contested.
+- If no obligation exists, return has_commitment=false.
 """
     
     headers = {"Content-Type": "application/json"}
@@ -226,6 +289,7 @@ Rules:
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     
+    metrics.increment("api_attempts")
     try:
         resp = httpx.post(url, json=body, headers=headers, timeout=10.0)
         resp.raise_for_status()
@@ -244,7 +308,148 @@ Rules:
         if extracted.get("confidence") is not None:
             extracted["confidence"] = float(extracted["confidence"])
             
+        extracted["extraction_method"] = "llm"
+        metrics.increment("llm_calls")
+        metrics.increment("extraction_calls")
         return extracted
     except Exception as e:
+        metrics.increment("api_errors")
         logger.exception("Gemini API extraction failed. Falling back to offline extraction.")
-        return extract_offline(text, now_utc, tz_name)
+        res = extract_offline(text, now_utc, tz_name)
+        res["extraction_method"] = "offline"
+        return res
+
+
+def resolve_ambiguity_via_gemini(text: str, candidates: list[Any]) -> str | None:
+    """Ask Gemini to resolve which commitment the user is talking about."""
+    if not GEMINI_API_KEY:
+        logger.info("GEMINI_API_KEY is not set. Cannot run LLM ambiguity resolution.")
+        return None
+
+    import bizpulse.metrics as metrics
+    metrics.increment("api_attempts")
+
+    candidates_desc = []
+    for c in candidates:
+        amount_or_obj = f"₹{c.amount_cents/100:,.0f}" if c.amount_cents else c.object
+        candidates_desc.append(
+            f"- ID: {c.id} | Party: {c.party} | Organization: {c.organization or 'None'} | "
+            f"Type: {c.type} | Object/Amount: {amount_or_obj} | Deadline: {c.deadline_raw} ({c.status})"
+        )
+    candidates_str = "\n".join(candidates_desc)
+
+    system_prompt = f"""You are an expert resolver for business commitments.
+An incoming message has been received in a conversation thread, and we need to match it to the correct unresolved commitment from the list of candidates.
+
+Incoming message: "{text}"
+
+Candidate unresolved commitments in this conversation:
+{candidates_str}
+
+Determine which commitment ID the incoming message is referring to.
+Return JSON only:
+{{
+  "matched_commitment_id": "string or null",
+  "reason": "brief explanation"
+}}
+"""
+
+    headers = {"Content-Type": "application/json"}
+    body = {
+        "contents": [{
+            "parts": [
+                {"text": system_prompt}
+            ]
+        }],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.0,
+            "maxOutputTokens": 128
+        }
+    }
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+
+    try:
+        resp = httpx.post(url, json=body, headers=headers, timeout=10.0)
+        resp.raise_for_status()
+        resp_json = resp.json()
+        raw_output = resp_json["candidates"][0]["content"]["parts"][0]["text"]
+        raw_output = raw_output.replace("```json", "").replace("```", "").strip()
+
+        import json
+        res = json.loads(raw_output)
+        matched_id = res.get("matched_commitment_id")
+        
+        metrics.increment("llm_calls")
+        metrics.increment("resolution_calls")
+        
+        # Verify matched_id exists in the candidates list
+        if any(c.id == matched_id for c in candidates):
+            logger.info("LLM resolved ambiguity to commitment ID: %s", matched_id)
+            return matched_id
+        return None
+    except Exception as e:
+        metrics.increment("api_errors")
+        logger.exception("Failed to resolve ambiguity via Gemini.")
+        return None
+
+
+def classify_low_signal_intent(text: str, minimal_context: str = "") -> str:
+    """Compact LLM call to classify the user's intent on low-signal input."""
+    import bizpulse.metrics as metrics
+    if not GEMINI_API_KEY:
+        return "casual"
+        
+    system_prompt = """You classify ambiguous user messages for a business commitment assistant.
+Return JSON only:
+{
+  "intent": "commitment" | "field_value" | "update" | "help" | "casual" | "irrelevant"
+}
+
+Rules:
+- commitment = user appears to describe an obligation
+- field_value = likely answer to a currently requested field
+- update = user changes an existing commitment
+- help = user asks how to use the assistant
+- casual = normal conversation
+- irrelevant = unrelated
+
+Do not extract the full commitment here."""
+
+    headers = {"Content-Type": "application/json"}
+    body = {
+        "contents": [{
+            "parts": [
+                {"text": f"{system_prompt}\n\nContext: \"{minimal_context}\"\nMessage: \"{text}\""}
+            ]
+        }],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.0,
+            "maxOutputTokens": 64
+        }
+    }
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    metrics.increment("api_attempts")
+    metrics.increment("recovery_llm_calls")
+    metrics.increment("llm_calls")
+    try:
+        import httpx
+        resp = httpx.post(url, json=body, headers=headers, timeout=10.0)
+        resp.raise_for_status()
+        resp_json = resp.json()
+        raw_output = resp_json["candidates"][0]["content"]["parts"][0]["text"]
+        raw_output = raw_output.replace("```json", "").replace("```", "").strip()
+        
+        import json
+        data = json.loads(raw_output)
+        intent = data.get("intent")
+        if intent in ("commitment", "field_value", "update", "help", "casual", "irrelevant"):
+            return intent
+        return "casual"
+    except Exception as e:
+        metrics.increment("api_errors")
+        logger.warning("Low-signal classification failed: %s", e)
+        return "casual"

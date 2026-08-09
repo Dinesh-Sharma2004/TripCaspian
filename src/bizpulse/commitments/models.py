@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 VALID_TRANSITIONS = {
-    'pending': {'due', 'overdue', 'rescheduled', 'disputed', 'abandoned'},
+    'pending': {'due', 'overdue', 'rescheduled', 'disputed', 'abandoned', 'fulfillment_claimed'},
     'due': {'overdue', 'fulfillment_claimed', 'disputed', 'rescheduled'},
     'overdue': {'fulfillment_claimed', 'rescheduled', 'escalated', 'abandoned', 'disputed'},
     'rescheduled': {'due', 'overdue', 'fulfillment_claimed', 'abandoned'},
@@ -45,6 +45,8 @@ class Commitment:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     last_followup_at: datetime | None = None
+    next_followup_at: datetime | None = None
+    extraction_method: str | None = None  # llm | offline
     followup_count: int = 0
     confidence: float = 1.0
     active_job_id: str | None = None
@@ -67,7 +69,7 @@ class Commitment:
         """Convert Commitment instance to a dictionary for SQLite storage."""
         data = asdict(self)
         # Convert datetime fields to ISO strings for serialization
-        for field_name in ["deadline_utc", "created_at", "updated_at", "last_followup_at"]:
+        for field_name in ["deadline_utc", "created_at", "updated_at", "last_followup_at", "next_followup_at"]:
             if data[field_name] and isinstance(data[field_name], datetime):
                 data[field_name] = data[field_name].isoformat()
         return data
@@ -79,7 +81,7 @@ class Commitment:
         kwargs = data.copy()
         
         # Parse datetime fields
-        for field_name in ["deadline_utc", "created_at", "updated_at", "last_followup_at"]:
+        for field_name in ["deadline_utc", "created_at", "updated_at", "last_followup_at", "next_followup_at"]:
             val = kwargs.get(field_name)
             if val:
                 if isinstance(val, str):

@@ -15,6 +15,30 @@ from bizpulse.config import DATABASE_PATH
 logger = logging.getLogger(__name__)
 
 
+_DEADLINE_CALLBACK: Any = None
+
+
+def register_callback(callback_fn: Any) -> None:
+    """Register the global callback for deadline jobs."""
+    global _DEADLINE_CALLBACK
+    _DEADLINE_CALLBACK = callback_fn
+
+
+def execute_deadline_job(commitment_id: str) -> None:
+    """Module-level callback function that APScheduler can pickle.
+
+    When fired, it forwards the execution to the registered global callback.
+    """
+    logger.info("Scheduler execution triggered for commitment %s", commitment_id)
+    if _DEADLINE_CALLBACK:
+        try:
+            _DEADLINE_CALLBACK(commitment_id)
+        except Exception as e:
+            logger.exception("Error executing deadline callback for %s: %s", commitment_id, e)
+    else:
+        logger.error("No deadline callback registered in CommitmentScheduler!")
+
+
 class CommitmentScheduler:
     """Wrapper around APScheduler using SQLAlchemyJobStore with SQLite for job persistence."""
 
@@ -51,7 +75,7 @@ class CommitmentScheduler:
         self,
         commitment_id: str,
         run_date: datetime,
-        callback: Callable[..., Any],
+        callback: Callable[..., Any] = None,
         *args,
         **kwargs,
     ) -> str:
@@ -65,6 +89,9 @@ class CommitmentScheduler:
         Returns:
             job_id string.
         """
+        if callback:
+            register_callback(callback)
+
         # Ensure run_date is timezone-naive UTC for APScheduler or timezone-aware matching the trigger
         # SQLite SQLAlchemyJobStore requires consistent datetime formats. Let's make sure it is naive UTC if timezone info is stripped or handled.
         if run_date.tzinfo is not None:
@@ -74,11 +101,10 @@ class CommitmentScheduler:
         job_id = f"deadline_{commitment_id}_{int(run_date.timestamp())}"
 
         self.scheduler.add_job(
-            func=callback,
+            func=execute_deadline_job,
             trigger='date',
             run_date=run_date,
-            args=[commitment_id] + list(args),
-            kwargs=kwargs,
+            args=[commitment_id],
             id=job_id,
             replace_existing=True,
         )

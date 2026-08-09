@@ -24,7 +24,7 @@ def test_bizpulse_conversation_flow(tmp_path):
         channel="telegram"
     )
     assert r1 is not None
-    assert "New Commitment Detected" in r1
+    assert "Arjun is supposed to pay" in r1
     assert "Arjun" in r1
     assert "₹42,000" in r1
 

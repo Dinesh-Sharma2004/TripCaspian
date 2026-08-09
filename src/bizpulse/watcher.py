@@ -66,6 +66,8 @@ class CommitmentWatcher:
         for c in commitments:
             # Watcher checks commitments that are pending or rescheduled with deadlines in the past
             if c.status in ("pending", "rescheduled") and c.deadline_utc <= now_utc:
+                if c.next_followup_at and c.next_followup_at > now_utc:
+                    continue
                 logger.info("Commitment %s deadline reached or passed (deadline=%s, now=%s)", c.id, c.deadline_utc, now_utc)
                 self.trigger_overdue(c)
 
