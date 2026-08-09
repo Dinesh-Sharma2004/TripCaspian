@@ -1,67 +1,75 @@
-"""Telegram Channel Integration Test Suite for TripCaspian.
-
-Verifies:
-1. Live Telegram Bot API authentication and identity (@tripcaspian_bot).
-2. Caspian CommClient Telegram integration flow.
-3. Message handling, trip planning, auto-booking scheduling, and seat alerts over Telegram.
-"""
+"""Telegram and Email Integration Test Suite for BizPulse."""
 
 import os
-import httpx
 import pytest
-from dotenv import load_dotenv, find_dotenv
-from tripcaspian.service import TripService
-from tripcaspian.storage import SQLiteStorage
-
-env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
-load_dotenv(env_path, override=True)
+from datetime import datetime, timezone, timedelta
+from bizpulse.service import BizPulseService
+from bizpulse.storage import SQLiteStorage
 
 
-def test_telegram_bot_token_validity():
-    """Verify Telegram bot token format and network endpoint."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        pytest.skip("TELEGRAM_BOT_TOKEN not set in environment")
-
-    try:
-        resp = httpx.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10.0)
-        assert resp.status_code in (200, 401), f"Unexpected status code {resp.status_code}"
-    except httpx.NetworkError:
-        pass
-
-
-def test_telegram_conversation_flow(tmp_path):
-    """Simulate complete Telegram conversation flow via TripService."""
+def test_bizpulse_conversation_flow(tmp_path):
+    """Simulate complete BizPulse conversation lifecycle."""
     db_file = str(tmp_path / "telegram_test.db")
     storage = SQLiteStorage(db_path=db_file)
-    service = TripService(storage=storage)
+    service = BizPulseService(storage=storage)
 
-    telegram_conv_id = "telegram_chat_test_12345"
-    sender = {"address": "@traveler_user", "channel": "telegram"}
+    conv_id = "telegram_chat_test_12345"
 
-    # Turn 1: User sends travel request
+    # Step 1: Ingest commitment
     r1 = service.handle_user_message(
-        conversation_id=telegram_conv_id,
-        sender=sender,
-        text="I want to go from Delhi to Jaipur for under 1200 rupees tomorrow morning",
+        conversation_id=conv_id,
+        sender={"address": "@traveler_user", "channel": "telegram"},
+        text="Arjun from Delta Traders said he'll pay ₹42,000 by Friday.",
+        message_id="m_001",
+        channel="telegram"
     )
-    assert "Top Travel Routes for Delhi ➡️ Jaipur" in r1
-    assert "IRCTC Vande Bharat Express" in r1 or "Zingbus" in r1
+    assert r1 is not None
+    assert "New Commitment Detected" in r1
+    assert "Arjun" in r1
+    assert "₹42,000" in r1
 
-    # Turn 2: Select option
+    # Verify database state
+    commitments = storage.get_unresolved_commitments(conv_id)
+    assert len(commitments) == 1
+    c = commitments[0]
+    assert c.status == "pending"
+
+    # Step 2: Simulate deadline reached (advance time in DB)
+    c.deadline_utc = datetime.now(timezone.utc) - timedelta(minutes=5)
+    storage.save_commitment(c)
+    
+    # Run Watcher check
+    service.watcher.check_all_commitments()
+
+    # Verify commitment is now overdue
+    c_updated = storage.get_commitment(c.id)
+    assert c_updated.status == "overdue"
+    assert c_updated.followup_count == 1
+
+    # Step 3: Reschedule
     r2 = service.handle_user_message(
-        conversation_id=telegram_conv_id,
-        sender=sender,
-        text="book option 1",
+        conversation_id=conv_id,
+        sender={"address": "@traveler_user", "channel": "telegram"},
+        text="Sorry, I'll pay Monday.",
+        message_id="m_002",
+        channel="telegram"
     )
-    assert "You selected Option 1" in r2
-    assert "book now" in r2
+    assert r2 is not None
+    assert "Commitment Rescheduled" in r2
+    assert "monday" in r2.lower()
+    c_rescheduled = storage.get_commitment(c.id)
+    assert c_rescheduled.status == "rescheduled"
 
-    # Turn 3: Get handoff link
+    # Step 4: Fulfillment claim
     r3 = service.handle_user_message(
-        conversation_id=telegram_conv_id,
-        sender=sender,
-        text="book now",
+        conversation_id=conv_id,
+        sender={"address": "@traveler_user", "channel": "telegram"},
+        text="Payment sent.",
+        message_id="m_003",
+        channel="telegram"
     )
-    assert "Your Trip Booking Handoff is Ready!" in r3
-    assert "Click here to book now" in r3
+    assert r3 is not None
+    assert "Fulfillment Claimed" in r3
+
+    c_fulfilled = storage.get_commitment(c.id)
+    assert c_fulfilled.status == "fulfillment_claimed"

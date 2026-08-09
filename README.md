@@ -1,81 +1,105 @@
-# TripCaspian 🧳 — Multi-Channel AI Trip-Planning & Booking Agent
+# BizPulse 💼 — Business Commitment & Obligation Agent
 
-> **Built for the Caspian Internship Track ("Build a Real Agent")**
-> Reachable via **Telegram**, **Discord**, and **Email** using a single unified `on_message` handler powered by [Caspian SDK](https://github.com/TryCaspian/caspian-sdk).
-
----
-
-## 1. Problem It Solves
-
-Travelers frequently waste hours jumping between IRCTC (trains), redBus (buses), and Uber/Ola (intercity cabs) to find options that fit both their time window and budget. **TripCaspian** acts as a unified conversational travel assistant. It accepts free-text travel requests, queries multiple transport providers simultaneously, scores every option on price and duration, applies intelligent 5–10% budget concessions when exact budget matches are missing, schedules delayed booking handoffs with one-click cancellation, and proactively alerts travelers when seats run low.
+> **Built for the Caspian Hackathon Submission**
+> Reachable via **Telegram** and **Email** using a single unified `on_message` and `on_interaction` handler powered by [Caspian SDK](https://github.com/TryCaspian/caspian-sdk).
 
 ---
 
-## 2. Architecture & How Caspian Fits
+## 1. Problem Statement & Context
+
+In daily business operations, promises and commitments are frequently made during conversations:
+* *"I'll pay ₹42,000 by Friday."*
+* *"The shipment will arrive Wednesday."*
+* *"I'll send the GST certificate tomorrow."*
+
+These obligations often get buried in chat histories, email threads, or messaging channels, requiring manual follow-ups, calendars, or spreadsheet trackers. **BizPulse** solves this by converting natural language commitments directly into structured business obligations, tracking their lifecycle deterministically, and proactively alerting the relevant parties when action is required.
+
+---
+
+## 2. Architecture & Pipeline
+
+BizPulse uses a multi-stage deterministic pipeline to process messages. The LLM is invoked only when semantic language understanding is strictly required, keeping token usage minimal.
 
 ```
-              ┌─────────────────────────────────────────────────────────┐
-              │           Connected Messaging Platforms                 │
-              │     Telegram Bot   │  Discord Bot  │  Email Inbox       │
-              └────────────────────────────┬────────────────────────────┘
-                                           │
-                                           ▼
-                              caspian_sdk.CommClient
-                                           │
-                                           ▼
-                           @client.on_message (Single Handler)
-                                           │
-                                           ▼
-                             tripcaspian.service.TripService
- ┌─────────────────────────────────────────┼─────────────────────────────────────────┐
- │                                         │                                         │
- ▼                                         ▼                                         ▼
-tripcaspian.intake               tripcaspian.optimizer                     tripcaspian.providers
-(NLU & Follow-ups)               (Normalized Scoring &                      (IRCTC, redBus, Uber SDK,
-                                 Budget Concession)                         Mock Fixture Data)
- │                                         │                                         │
- └─────────────────────────────────────────┼─────────────────────────────────────────┘
-                                           │
-                                           ▼
-                       tripcaspian.storage.SQLiteStorage
-                       (WAL Mode + Conversation Mutex Locks)
-                                           │
-                        ┌──────────────────┴──────────────────┐
-                        ▼                                     ▼
-            tripcaspian.scheduler                     tripcaspian.watcher
-        (APScheduler + SQLiteJobStore)           (Background Availability Poller)
-                        │                                     │
-                        └──────────────────┬──────────────────┘
-                                           │
-                                           ▼
-                       client.send_message(conversation_id, text)
-                       (Proactive Outbound Alerts & Delayed Handoffs)
+                  ┌─────────────────────────────────────────┐
+                  │      Caspian Inbound Channels           │
+                  │       Telegram  │  Email Inbox          │
+                  └────────────────────┬────────────────────┘
+                                       │
+                                       ▼
+                             caspian_sdk.CommClient
+                                       │
+                                       ▼
+                       @client.on_message (Single Handler)
+                                       │
+                                       ▼
+                       bizpulse.service.BizPulseService
+  ┌────────────────────────────────────┼────────────────────────────────────┐
+  │                                    │                                    │
+  ▼                                    ▼                                    ▼
+1. Deduplication                    2. Normalizer                        3. Signal Gate
+(Channel + Message ID)              (Strips quotes/signatures)           (Deterministic Scoring)
+  │                                    │                                    │
+  └────────────────────────────────────┼────────────────────────────────────┘
+                                       │
+                                       ▼
+                                4. LLM Extractor
+                             (Gemini 2.5 Flash / Rule-based)
+                                       │
+                                       ▼
+                                 5. Resolver
+                            (Matches active commitments)
+                                       │
+                                       ▼
+                           bizpulse.storage.SQLiteStorage
+                                       │
+                    ┌──────────────────┴──────────────────┐
+                    ▼                                     ▼
+          bizpulse.scheduler                      bizpulse.watcher
+     (APScheduler + SQLiteJobStore)          (Resilient Overdue Poller)
+                    │                                     │
+                    └──────────────────┬──────────────────┘
+                                       │
+                                       ▼
+                        client.send_message (outbound)
 ```
 
-### Why Caspian?
-- **Single Identity Across Channels**: All incoming messages flow through one `@client.on_message` callback keyed by `message.conversation_id`.
-- **Zero Per-Platform Boilerplate**: Telegram, Discord, and Email are connected with 3 lines of code (`connect_telegram`, `connect_discord`/`install_discord`, `connect_email`).
-- **Proactive Outbound Messaging**: Uses `client.send_message(conversation_id, text)` to trigger proactive seat alerts and delayed handoffs across any channel without waiting for a user prompt.
+### Ingestion Pipeline Stages:
+1. **Deduplicate**: Deduplicates incoming messages by `(channel, message_id)` keys to prevent double-processing.
+2. **Normalize**: Extracts the core text from raw emails/messages, stripping signatures, quoted email replies, HTML tags, and collapsing whitespace. Hard capped at 2,000 characters.
+3. **Gate**: Deterministically scores signals in the normalized text (action verbs, money terms, obligation phrases, status words). If the score is `< 3`, the message is ignored, costing **0 tokens**.
+4. **Extraction**: Invokes `gemini-2.5-flash` with a structured schema to parse commitment fields (or falls back to a deterministic rule-based offline extractor if `GEMINI_API_KEY` is missing).
+5. **Resolve**: Scores candidates against unresolved commitments for the same conversation ID. Matches with score $\ge 5$ update existing commitments; otherwise, new commitments are created.
+6. **Lifecycle Update & Scheduling**: Saves to SQLite, schedules exact deadline alerts using APScheduler, and manages background watcher safety nets.
 
 ---
 
-## 3. Provider Integration & Honest Scoping
+## 3. Supported Ingestion Channels
 
-### Provider Integration Overview
-- **IRCTC (Train)**: Offers fare and train schedule lookups via partner API or mock fixtures. Checkout uses prefilled IRCTC deep links.
-- **redBus (Bus)**: Uses `parse_apis.redBus_Bus_and_Train_API` when present or mock bus travel fixtures.
-- **Uber (Cab)**: Integrates the official **`uber-rides` Python SDK** (`UberRidesClient`).
+BizPulse supports Caspian-native channels:
+* **Telegram**: Direct messaging with bot credentials.
+* **Email**: Caspian-hosted custom email inboxes (`username@agents.trycaspianai.com`).
 
-### Official Uber Rides SDK Integration
-- **Search & Estimates**: Uses `client.get_products()` and `client.get_price_estimates()` to fetch real-time product options and fares.
-- **OAuth Rider Authentication**: Built-in helpers (`create_auth_url`, `exchange_code`, `save_credentials`, `load_credentials`) manage `AuthorizationCodeGrant` flows.
-- **Booking & Management**: `initiate_booking()` calls `client.request_ride()`, `get_booking_status()` calls `client.get_ride_details()`, and `cancel_booking()` calls `client.cancel_ride()`.
-- **Sandbox Mode**: Configured via `UBER_SANDBOX=true`.
-- **Scope Limitations Note**: Autonomous ride booking (`request_ride`) requires Uber's privileged `request` OAuth scope, which requires Uber developer app approval. When unauthenticated, TripCaspian cleanly provides prefilled Uber deep links.
+*BizPulse does NOT claim to automatically monitor WhatsApp, Slack, bank accounts, UPI gateways, or CRM systems. All fulfillments must be conversational claims or manually verified.*
 
 ---
 
-## 4. Setup & Environment Variables
+## 4. Commitment Lifecycle
+
+Every commitment goes through a strict state machine:
+* **pending** — Created, awaiting deadline.
+* **due** — Deadline reached, not yet overdue.
+* **overdue** — Past deadline, unresolved.
+* **rescheduled** — Deadline updated by counterparty (cancels old scheduler jobs, creates new ones).
+* **fulfillment_claimed** — Counterparty claims to have completed the commitment (e.g. *"payment sent"*).
+* **verified_fulfilled** — Manually confirmed by owner.
+* **disputed** — Obligation contested by counterparty.
+* **escalated** — Escalated after repeated failures.
+* **abandoned** — Explicitly dropped.
+
+---
+
+## 5. Setup & Running the Agent
 
 ### Installation
 
@@ -84,83 +108,52 @@ tripcaspian.intake               tripcaspian.optimizer                     tripc
 git clone https://github.com/Dinesh-Sharma2004/CodeRunner.git
 cd tripcaspian
 
-# Install dependencies including official uber-rides SDK
+# Install package and dependencies in editable mode
 pip install -e .
-pip install uber-rides
 ```
 
 ### Configuration (`.env`)
 
-Copy `.env.example` to `.env` and configure your credentials:
-
-```bash
-cp .env.example .env
-```
+Configure the following variables in `.env`:
 
 ```env
 # Caspian API Configuration
-CASPIAN_API_KEY=your_caspian_api_key_here
+CASPIAN_API_KEY=your_caspian_key_here
 CASPIAN_BASE_URL=https://api.trycaspianai.com
 
 # Channel Bot Credentials
-TELEGRAM_BOT_TOKEN=123456789:ABCdefGHI...
-DISCORD_BOT_TOKEN=
-DISCORD_DISPLAY_NAME=TripCaspian
-EMAIL_USERNAME=tripcaspian
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+EMAIL_USERNAME=bizpulse
 
-# Provider Mode (mock | live)
-PROVIDER_MODE=mock
-IRCTC_PARTNER_KEY=
-REDBUS_PARTNER_KEY=
+# Gemini API Key (Optional. If omitted, falls back to deterministic rule extractor)
+GEMINI_API_KEY=your_gemini_key_here
 
-# Official Uber Rides Python SDK Configuration
-UBER_SERVER_TOKEN=your_server_token_here
-UBER_CLIENT_ID=your_client_id_here
-UBER_CLIENT_SECRET=your_client_secret_here
-UBER_REDIRECT_URI=http://localhost:8000/oauth/callback
-UBER_SANDBOX=true
-
-# Storage & Polling Settings
+# Storage Settings
 DATABASE_PATH=tripcaspian.db
 WATCHER_POLL_INTERVAL=30
 ```
 
----
+### How to Run
 
-## 5. How to Run & Test
-
-### Start the Agent
+To run the agent and start listening to connected Caspian channels:
 
 ```bash
-python -m tripcaspian.agent
+.venv\Scripts\python -m bizpulse.agent
 ```
 
-### Run Unit Test Suite
+### How to Test
+
+To run the test suite (all tests execute locally and use the fallback rule extractor, requiring zero external API keys):
 
 ```bash
-py -m pytest --basetemp=./.pytest_tmp -v
+.venv\Scripts\pytest --basetemp=.pytest_tmp
 ```
-
-All unit test suites (including `tests/test_uber_provider.py`) execute cleanly.
 
 ---
 
-## 6. Evaluation Criteria Write-Up
+## 6. Known Limitations & Future Roadmap
 
-### Problem Solved
-TripCaspian solves multi-modal travel planning friction in India. Travelers comparing trains, buses, and cabs across different budgets and schedules no longer need to check multiple apps manually. TripCaspian standardizes route discovery, applies intelligent budget concessions, and automates tracking in chat.
-
-### Code Quality & Engineering
-Built with modular Python architecture:
-- **`service.py`**: State machine facade isolating Caspian infrastructure from domain logic.
-- **`storage.py`**: Thread-safe SQLite engine with WAL mode and per-conversation locks.
-- **`optimizer.py`**: Pure function scoring with deterministic 5-tier tie-breaking.
-- **`scheduler.py`**: APScheduler backed by `SQLiteJobStore` for persistent delayed handoffs.
-- **`watcher.py`**: Subscription-based background polling thread for seat & price alerts.
-- **`cab_ola_uber.py`**: Official `uber-rides` Python SDK integration with `AuthorizationCodeGrant` and `ProviderError` handling.
-
-### Adoption & Practicality
-Ready for real-world deployment across Telegram, Discord, and Email. The deep-link handoff and OAuth strategy respects provider ToS and security constraints while providing prefilled routes directly to users.
-
-### How Caspian Fits
-Caspian serves as the central communication backbone. Rather than building per-platform bot integrations or webhook endpoints, TripCaspian connects multiple messaging platforms to a single `on_message` handler and leverages `client.send_message()` for proactive background notifications.
+### Known Limitations:
+1. **Conversation Scope Only**: Commitments are resolved and matched within the same `conversation_id`. Rescheduling via email will not automatically link to a Telegram commitment in v0.1 (cross-channel entity mapping is deferred).
+2. **Smallest Unit Integer Amounts**: Amounts are stored in cents/paise (integer values) to avoid floating point math errors.
+3. **No Auto-verification**: UPI/bank account verification does not exist. Statuses change to `fulfillment_claimed` upon conversational statement.

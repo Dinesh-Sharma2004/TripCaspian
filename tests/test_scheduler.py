@@ -1,31 +1,33 @@
-"""Unit tests for TripCaspian BookingScheduler."""
+"""Unit tests for BizPulse CommitmentScheduler."""
 
 import time
 import pytest
-from tripcaspian.scheduler import BookingScheduler
+from datetime import datetime, timedelta, timezone
+from bizpulse.scheduler import CommitmentScheduler
 
 FIRED_COUNTS = {"count": 0}
 
 
-def sample_callback(conv_id):
+def sample_callback(commitment_id):
     FIRED_COUNTS["count"] += 1
 
 
 def test_schedule_and_fire(tmp_path):
     db_file = str(tmp_path / "test_scheduler.db")
-    scheduler = BookingScheduler(db_path=db_file)
+    scheduler = CommitmentScheduler(db_path=db_file)
     scheduler.start()
 
     FIRED_COUNTS["count"] = 0
 
-    job_id = scheduler.schedule_auto_booking(
-        conversation_id="conv_123",
-        delay_seconds=1,
-        callback=sample_callback,
-        conv_id="conv_123",
+    # Schedule for 1 second in the future
+    run_date = datetime.now(timezone.utc) + timedelta(seconds=1)
+    job_id = scheduler.schedule_deadline_alert(
+        commitment_id="c_123",
+        run_date=run_date,
+        callback=sample_callback
     )
 
-    assert job_id.startswith("job_conv_123")
+    assert job_id.startswith("deadline_c_123")
 
     # Wait for job to fire
     time.sleep(1.5)
@@ -36,16 +38,17 @@ def test_schedule_and_fire(tmp_path):
 
 def test_schedule_and_cancel_before_fire(tmp_path):
     db_file = str(tmp_path / "test_scheduler_cancel.db")
-    scheduler = BookingScheduler(db_path=db_file)
+    scheduler = CommitmentScheduler(db_path=db_file)
     scheduler.start()
 
     FIRED_COUNTS["count"] = 0
 
-    job_id = scheduler.schedule_auto_booking(
-        conversation_id="conv_456",
-        delay_seconds=2,
-        callback=sample_callback,
-        conv_id="conv_456",
+    # Schedule for 2 seconds in the future
+    run_date = datetime.now(timezone.utc) + timedelta(seconds=2)
+    job_id = scheduler.schedule_deadline_alert(
+        commitment_id="c_456",
+        run_date=run_date,
+        callback=sample_callback
     )
 
     # Cancel immediately before it fires

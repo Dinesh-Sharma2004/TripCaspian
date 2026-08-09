@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tripcaspian"
+name = "bizpulse"
 version = "0.1.0"
-description = "A multi-channel trip-planning & booking agent powered by Caspian SDK"
+description = "A business commitment and obligation lifecycle tracking agent powered by Caspian SDK"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
     "apscheduler>=3.10.0",
     "pytest>=8.0.0",
     "python-dotenv>=1.0.0",
+    "python-dateutil>=2.8.0",
 ]
 
 [project.optional-dependencies]
