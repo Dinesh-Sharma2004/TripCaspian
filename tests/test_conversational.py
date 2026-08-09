@@ -135,7 +135,7 @@ def test_missing_amount_and_clarification(tmp_path, monkeypatch):
         channel="telegram"
     )
     assert r2 is not None
-    assert "arjun is supposed to pay ₹42,000 by friday" in r2.lower()
+    assert "got it. i'm tracking ₹42,000 from arjun, due friday" in r2.lower()
     
     # Draft must be cleaned up
     assert storage.get_draft("conv_clar") is None
@@ -160,7 +160,7 @@ def test_missing_deadline_clarification(tmp_path):
         channel="telegram"
     )
     assert r1 is not None
-    assert "When is this due?" in r1
+    assert "When is the payment expected?" in r1
     
     draft = storage.get_draft("conv_dl")
     assert draft["missing_field"] == "deadline"
@@ -174,7 +174,7 @@ def test_missing_deadline_clarification(tmp_path):
         channel="telegram"
     )
     assert r2 is not None
-    assert "arjun is supposed to pay ₹42,000 by friday" in r2.lower()
+    assert "got it. i'm tracking ₹42,000 from arjun, due friday" in r2.lower()
     
     assert storage.get_draft("conv_dl") is None
     commitments = storage.get_unresolved_commitments("conv_dl")

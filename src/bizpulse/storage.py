@@ -84,28 +84,76 @@ class SQLiteStorage:
                 );
             """)
             
-            # Create drafts table
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS drafts (
-                    conversation_id TEXT PRIMARY KEY,
-                    party TEXT,
-                    organization TEXT,
-                    type TEXT,
-                    action TEXT,
-                    object TEXT,
-                    amount_cents INTEGER,
-                    currency TEXT,
-                    deadline_utc TEXT,
-                    deadline_raw TEXT,
-                    intent TEXT,
-                    source_message_id TEXT,
-                    source_channel TEXT,
-                    source_text TEXT,
-                    missing_field TEXT,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
+            # Create drafts table with migration check
+            cursor = conn.execute("PRAGMA table_info(drafts);")
+            columns = [row["name"] for row in cursor.fetchall()]
+            
+            if columns and "draft_id" not in columns:
+                logger.info("Migrating drafts table to new schema...")
+                conn.execute("ALTER TABLE drafts RENAME TO drafts_old;")
+                conn.execute("""
+                    CREATE TABLE drafts (
+                        draft_id TEXT PRIMARY KEY,
+                        conversation_id TEXT,
+                        party TEXT,
+                        organization TEXT,
+                        type TEXT,
+                        action TEXT,
+                        object TEXT,
+                        amount_cents INTEGER,
+                        currency TEXT,
+                        deadline_utc TEXT,
+                        deadline_raw TEXT,
+                        intent TEXT,
+                        source_message_id TEXT,
+                        source_channel TEXT,
+                        source_text TEXT,
+                        missing_field TEXT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_drafts_conversation_id ON drafts(conversation_id);")
+                conn.execute("""
+                    INSERT INTO drafts (
+                        draft_id, conversation_id, party, organization, type, action, object,
+                        amount_cents, currency, deadline_utc, deadline_raw, intent,
+                        source_message_id, source_channel, source_text, missing_field,
+                        created_at, updated_at
+                    )
+                    SELECT 
+                        'draft_' || conversation_id, conversation_id, party, organization, type, action, object,
+                        amount_cents, currency, deadline_utc, deadline_raw, intent,
+                        source_message_id, source_channel, source_text, missing_field,
+                        created_at, updated_at
+                    FROM drafts_old;
+                """)
+                conn.execute("DROP TABLE drafts_old;")
+                logger.info("Successfully migrated drafts table.")
+            elif not columns:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS drafts (
+                        draft_id TEXT PRIMARY KEY,
+                        conversation_id TEXT,
+                        party TEXT,
+                        organization TEXT,
+                        type TEXT,
+                        action TEXT,
+                        object TEXT,
+                        amount_cents INTEGER,
+                        currency TEXT,
+                        deadline_utc TEXT,
+                        deadline_raw TEXT,
+                        intent TEXT,
+                        source_message_id TEXT,
+                        source_channel TEXT,
+                        source_text TEXT,
+                        missing_field TEXT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_drafts_conversation_id ON drafts(conversation_id);")
 
             # Create onboarding_status table
             conn.execute("""
@@ -229,6 +277,31 @@ class SQLiteStorage:
 
     def save_draft(self, draft: dict[str, Any]) -> None:
         """Save or update a commitment draft in persistent storage."""
+        if not draft.get("draft_id"):
+            import uuid
+            draft["draft_id"] = f"draft_{uuid.uuid4().hex[:6]}"
+            
+        full_draft = {
+            "draft_id": None,
+            "conversation_id": None,
+            "party": None,
+            "organization": None,
+            "type": None,
+            "action": None,
+            "object": None,
+            "amount_cents": None,
+            "currency": None,
+            "deadline_utc": None,
+            "deadline_raw": None,
+            "intent": None,
+            "source_message_id": None,
+            "source_channel": None,
+            "source_text": None,
+            "missing_field": None,
+        }
+        full_draft.update(draft)
+        draft = full_draft
+            
         lock = get_conversation_lock(draft["conversation_id"])
         with lock:
             conn = self._get_connection()
@@ -236,17 +309,18 @@ class SQLiteStorage:
                 conn.execute(
                     """
                     INSERT INTO drafts (
-                        conversation_id, party, organization, type, action, object,
+                        draft_id, conversation_id, party, organization, type, action, object,
                         amount_cents, currency, deadline_utc, deadline_raw, intent,
                         source_message_id, source_channel, source_text, missing_field,
                         updated_at
                     ) VALUES (
-                        :conversation_id, :party, :organization, :type, :action, :object,
+                        :draft_id, :conversation_id, :party, :organization, :type, :action, :object,
                         :amount_cents, :currency, :deadline_utc, :deadline_raw, :intent,
                         :source_message_id, :source_channel, :source_text, :missing_field,
                         CURRENT_TIMESTAMP
                     )
-                    ON CONFLICT(conversation_id) DO UPDATE SET
+                    ON CONFLICT(draft_id) DO UPDATE SET
+                        conversation_id = excluded.conversation_id,
                         party = excluded.party,
                         organization = excluded.organization,
                         type = excluded.type,
@@ -266,24 +340,51 @@ class SQLiteStorage:
                     draft,
                 )
 
-    def get_draft(self, conversation_id: str) -> dict[str, Any] | None:
-        """Retrieve a draft by conversation ID."""
+    def get_draft(self, id_or_conv_id: str) -> dict[str, Any] | None:
+        """Retrieve a draft by draft_id OR conversation_id (fallback to latest draft)."""
+        lock = get_conversation_lock(id_or_conv_id)
+        with lock:
+            conn = self._get_connection()
+            cursor = conn.execute("SELECT * FROM drafts WHERE draft_id = ?", (id_or_conv_id,))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            cursor = conn.execute("SELECT * FROM drafts WHERE conversation_id = ? ORDER BY updated_at DESC LIMIT 1", (id_or_conv_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_latest_draft(self, conversation_id: str) -> dict[str, Any] | None:
+        """Retrieve the most recently updated draft for a conversation ID."""
         lock = get_conversation_lock(conversation_id)
         with lock:
             conn = self._get_connection()
-            cursor = conn.execute("SELECT * FROM drafts WHERE conversation_id = ?", (conversation_id,))
+            cursor = conn.execute(
+                "SELECT * FROM drafts WHERE conversation_id = ? ORDER BY updated_at DESC LIMIT 1",
+                (conversation_id,)
+            )
             row = cursor.fetchone()
-            if not row:
-                return None
-            return dict(row)
+            return dict(row) if row else None
 
-    def delete_draft(self, conversation_id: str) -> None:
-        """Delete a draft by conversation ID."""
+    def get_drafts_for_conversation(self, conversation_id: str) -> list[dict[str, Any]]:
+        """Retrieve all drafts for a conversation ID."""
         lock = get_conversation_lock(conversation_id)
+        with lock:
+            conn = self._get_connection()
+            cursor = conn.execute(
+                "SELECT * FROM drafts WHERE conversation_id = ? ORDER BY updated_at DESC",
+                (conversation_id,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def delete_draft(self, id_or_conv_id: str) -> None:
+        """Delete a draft by draft_id or fallback to deleting all drafts for a conversation_id."""
+        lock = get_conversation_lock(id_or_conv_id)
         with lock:
             conn = self._get_connection()
             with conn:
-                conn.execute("DELETE FROM drafts WHERE conversation_id = ?", (conversation_id,))
+                cursor = conn.execute("DELETE FROM drafts WHERE draft_id = ?", (id_or_conv_id,))
+                if cursor.rowcount == 0:
+                    conn.execute("DELETE FROM drafts WHERE conversation_id = ?", (id_or_conv_id,))
 
     def has_sent_onboarding(self, conversation_id: str) -> bool:
         """Check if onboarding was already sent in this conversation."""

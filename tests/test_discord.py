@@ -91,7 +91,7 @@ def test_discord_missing_field_slot_filling(tmp_path, monkeypatch):
     )
     
     assert r2 is not None
-    assert "Arjun is supposed to pay ₹42,000 by friday" in r2
+    assert "got it. i'm tracking ₹42,000 from arjun, due friday" in r2.lower()
     
     # Verify commitment was successfully saved
     commitments = storage.get_unresolved_commitments(conv_id)

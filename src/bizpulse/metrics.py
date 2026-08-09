@@ -17,7 +17,11 @@ _METRICS = {
     "clarification_responses": 0,
     "recovery_llm_calls": 0,
     "field_values_resolved_deterministically": 0,
-    "onboarding_messages": 0
+    "onboarding_messages": 0,
+    "clarification_requests": 0,
+    "validation_attempts": 0,
+    "invalid_responses": 0,
+    "incomplete_commitments": 0
 }
 
 def increment(metric_name: str) -> None:

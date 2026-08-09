@@ -18,7 +18,7 @@ from bizpulse.commitments.extractor import extract_commitment, validate_extracti
 from bizpulse.commitments.resolver import resolve_commitment
 from bizpulse.commitments.lifecycle import apply_reschedule, apply_fulfillment, apply_dispute
 from bizpulse.commitments.templates import get_rescheduled_blocks, format_amount
-
+from bizpulse.commitments.validation import validate_field_locally, validate_field_via_llm
 logger = logging.getLogger(__name__)
 
 
@@ -37,7 +37,8 @@ def find_missing_required_field(data: dict[str, Any]) -> str | None:
             return "object"
             
     if not data.get("deadline_utc"):
-        return "deadline"
+        if c_type != "approval":
+            return "deadline"
     return None
 
 
@@ -45,21 +46,92 @@ def get_clarification_question(field: str, draft: dict[str, Any]) -> str:
     party = draft.get("party") or "they"
     c_type = draft.get("type") or "obligation"
     if field == "amount":
-        if party.lower() == "arjun":
-            return f"Got it 👍\nI found a payment commitment from Arjun.\n\nHow much is he supposed to pay?"
-        return f"Got it 👍\nI found a payment commitment from {party}.\n\nHow much is {party} supposed to pay?"
+        if draft.get("amount_cents") is None and not draft.get("deadline_utc"):
+            return "What amount should I record, and when is the payment expected?"
+        return f"How much is he supposed to pay?" if party.lower() == "arjun" else f"How much is {party} supposed to pay?"
     elif field == "deadline":
-        return f"Got it 👍\nI found a {c_type} commitment from {party}.\n\nWhen is this due?"
+        if c_type == "payment":
+            return "When is the payment expected?"
+        elif c_type == "delivery":
+            obj = draft.get("object") or "item"
+            if obj.lower().startswith("the "):
+                return f"When is {obj} expected?"
+            return f"When is the {obj} expected?"
+        return "When is this due?"
     elif field == "party":
-        return "Got it 👍\nI found a commitment.\n\nWho is making this promise?"
+        return "Who is responsible for this commitment?"
     elif field == "object":
         if c_type == "document":
-            return f"Got it 👍\nI found a document commitment from {party}.\n\nWhich document needs to be sent?"
-        else:
-            return f"Got it 👍\nI found a delivery commitment from {party}.\n\nWhat item is {party} supposed to deliver?"
-    elif field == "action" or field == "object":
-        return f"Got it 👍\nI found a commitment from {party}.\n\nWhat item or action is {party} supposed to perform?"
+            return "Which document needs to be sent?"
+        return "What exactly should be delivered/sent/completed?"
     return "Could you please clarify the missing details for this commitment?"
+
+
+def get_invalid_clarification(field: str, text: str, draft: dict[str, Any]) -> str:
+    c_type = draft.get("type") or "obligation"
+    lower_text = text.lower().strip()
+    
+    if field == "amount":
+        for day in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "tomorrow", "next week", "today"]:
+            if day in lower_text:
+                return f"{text} looks like a date. I still need the payment amount, for example ₹42,000."
+        return "That doesn't provide the amount I need. Please provide amount."
+        
+    elif field == "deadline":
+        from bizpulse.commitments.extractor import extract_amount_from_text
+        amt_cents, _ = extract_amount_from_text(lower_text)
+        if amt_cents is not None:
+            return f"{text} looks like an amount. I still need the expected date, for example Friday or tomorrow."
+        return "That doesn't provide the deadline I need. Please provide deadline."
+        
+    elif field == "party":
+        return "Who is responsible for this commitment?"
+        
+    elif field == "object":
+        return "What exactly should be delivered/sent/completed?"
+        
+    return f"I still need the {field} to complete this commitment."
+
+
+def get_unrelated_clarification(field: str, draft: dict[str, Any]) -> str:
+    c_type = draft.get("type") or "obligation"
+    if field == "amount":
+        return "I still need the payment amount, for example ₹42,000."
+    elif field == "deadline":
+        return "I still need the expected date, for example tomorrow or Friday."
+    elif field == "party":
+        return "Who is responsible for this commitment?"
+    elif field == "object":
+        return "What exactly should be delivered/sent/completed?"
+    return f"I still need the {field} to complete this commitment."
+
+
+def format_email_body(missing_fields: list[str], c_type: str) -> str:
+    field_labels = {
+        "amount": "payment amount",
+        "deadline": "expected payment date" if c_type == "payment" else "expected date",
+        "party": "responsible party name",
+        "object": "document name" if c_type == "document" else ("expected delivery item" if c_type == "delivery" else "item or action details"),
+        "action": "action to perform"
+    }
+    bullets = "\n".join(f"• {field_labels.get(f, f)}" for f in missing_fields)
+    
+    if c_type == "payment":
+        example = "₹42,000 by Friday."
+    elif c_type == "delivery":
+        example = "replacement motor by tomorrow."
+    else:
+        example = "the document by Friday."
+        
+    return (
+        f"Hi,\n\n"
+        f"I can track this commitment, but I still need:\n\n"
+        f"{bullets}\n\n"
+        f"You can reply with both, for example:\n\n"
+        f"{example}\n\n"
+        f"Thanks,\n"
+        f"BizPulse"
+    )
 
 
 class BizPulseService:
@@ -300,105 +372,151 @@ class BizPulseService:
         normalized_text = normalize_message(text, subject)
         logger.info("Normalized message text: '%s'", normalized_text)
 
-        # Stage 2.5: Check for Pending Draft Clarification Reply
-        draft = self.storage.get_draft(conversation_id)
-        if draft:
+        # Stage 2.5: Check for Pending Draft Clarification Reply (Context Bypass Gate)
+        drafts = self.storage.get_drafts_for_conversation(conversation_id)
+        if drafts:
             metrics.increment("messages_seen")
-            missing_field = draft.get("missing_field")
+            
+            # Select target draft using contextual, expected field and party matching
+            target_draft = None
+            if len(drafts) == 1:
+                target_draft = drafts[0]
+            else:
+                matched = []
+                for d in drafts:
+                    score = 0
+                    missing_f = d.get("missing_field")
+                    v_res = validate_field_locally(missing_f, normalized_text, d.get("type"))
+                    if v_res["valid"]:
+                        score += 3
+                    party = d.get("party") or ""
+                    if party.lower() in normalized_text.lower():
+                        score += 5
+                    d_type = d.get("type") or ""
+                    if d_type == "payment" and any(w in normalized_text.lower() for w in ["pay", "payment", "amount", "money", "rupees", "inr"]):
+                        score += 2
+                    elif d_type == "delivery" and any(w in normalized_text.lower() for w in ["deliver", "delivery", "ship", "goods", "replacement", "motor"]):
+                        score += 2
+                    elif d_type == "document" and any(w in normalized_text.lower() for w in ["doc", "document", "gst", "send", "report"]):
+                        score += 2
+                    if score > 0:
+                        matched.append((d, score))
+                if matched:
+                    matched.sort(key=lambda x: x[1], reverse=True)
+                    if len(matched) == 1 or matched[0][1] > matched[1][1]:
+                        target_draft = matched[0][0]
+                    else:
+                        desc1 = f"{matched[0][0].get('party')}'s {matched[0][0].get('type')}"
+                        desc2 = f"{matched[1][0].get('party')}'s {matched[1][0].get('type')}"
+                        return f"I have more than one commitment that could match this. Is this about {desc1} or {desc2}?"
+                else:
+                    target_draft = drafts[0]
+
+            missing_field = target_draft.get("missing_field")
             logger.info("Handling response for pending draft. Missing field: %s", missing_field)
             
-            # Deterministic parsing first
-            parsed = False
-            if missing_field == "amount":
-                from bizpulse.commitments.extractor import extract_amount_from_text
-                amt_cents, curr = extract_amount_from_text(normalized_text.lower())
-                if amt_cents is not None:
-                    draft["amount_cents"] = amt_cents
-                    draft["currency"] = curr or "INR"
-                    draft["missing_field"] = None
-                    parsed = True
-                else:
-                    import re
-                    num_match = re.search(r'\b\d{1,3}(?:,\d{3})*(?:\.\d{2})?\b|\b\d{3,}(?:\.\d{2})?\b', normalized_text)
-                    if num_match:
-                        val = int(num_match.group(0).replace(",", "").split(".")[0])
-                        draft["amount_cents"] = val * 100
-                        draft["currency"] = "INR"
-                        draft["missing_field"] = None
-                        parsed = True
-            elif missing_field == "deadline":
-                from bizpulse.commitments.extractor import resolve_relative_deadline
-                now_utc = datetime.datetime.now(datetime.timezone.utc)
-                day = None
-                lower_norm = normalized_text.lower()
-                for d in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "tomorrow", "next week", "today"]:
-                    if d in lower_norm:
-                        day = d
-                        break
-                if day:
-                    try:
-                        d_utc = resolve_relative_deadline(now_utc, day, DEFAULT_TIMEZONE)
-                        draft["deadline_utc"] = d_utc.isoformat()
-                        draft["deadline_raw"] = day
-                        draft["missing_field"] = None
-                        parsed = True
-                    except Exception:
-                        pass
-            elif missing_field == "party":
-                draft["party"] = normalized_text
-                draft["missing_field"] = None
-                parsed = True
-            elif missing_field in ("object", "action"):
-                draft[missing_field] = normalized_text
-                draft["missing_field"] = None
-                parsed = True
-
-            # Fall back to LLM ONLY if deterministic parsing failed
-            if not parsed:
-                logger.info("Deterministic parsing failed for draft response. Calling Gemini API.")
-                now_utc = datetime.datetime.now(datetime.timezone.utc)
-                extracted = extract_commitment(normalized_text, now_utc, DEFAULT_TIMEZONE)
-                
-                if missing_field == "amount" and extracted.get("amount_cents") is not None:
-                    draft["amount_cents"] = extracted["amount_cents"]
-                    draft["currency"] = extracted.get("currency") or "INR"
-                    draft["missing_field"] = None
-                elif missing_field == "deadline" and extracted.get("deadline_utc"):
-                    draft["deadline_utc"] = extracted["deadline_utc"]
-                    draft["deadline_raw"] = extracted.get("deadline_raw")
-                    draft["missing_field"] = None
-                elif missing_field == "party" and extracted.get("party") and extracted.get("party").lower() != "counterparty":
-                    draft["party"] = extracted["party"]
-                    if extracted.get("organization"):
-                        draft["organization"] = extracted["organization"]
-                    draft["missing_field"] = None
-                elif missing_field == "object" and extracted.get("object"):
-                    draft["object"] = extracted["object"]
-                    draft["missing_field"] = None
-                elif missing_field == "action" and extracted.get("action"):
-                    draft["action"] = extracted["action"]
-                    draft["missing_field"] = None
-            if parsed:
-                metrics.increment("field_values_resolved_deterministically")
-
-            if draft["missing_field"] is None:
+            # 1. Try offline extraction first to see if they provided multiple fields in a single message
+            from bizpulse.commitments.extractor import extract_offline
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            extracted = extract_offline(normalized_text, now_utc, DEFAULT_TIMEZONE)
+            updated_any = False
+            
+            if extracted and extracted.get("has_commitment"):
+                if target_draft.get("amount_cents") is None and extracted.get("amount_cents") is not None:
+                    target_draft["amount_cents"] = extracted["amount_cents"]
+                    target_draft["currency"] = extracted.get("currency") or "INR"
+                    updated_any = True
+                if not target_draft.get("deadline_utc") and extracted.get("deadline_utc"):
+                    target_draft["deadline_utc"] = extracted["deadline_utc"]
+                    target_draft["deadline_raw"] = extracted.get("deadline_raw")
+                    updated_any = True
+                if (not target_draft.get("party") or target_draft.get("party") == "Counterparty") and extracted.get("party") and extracted.get("party") != "Counterparty":
+                    target_draft["party"] = extracted["party"]
+                    updated_any = True
+                if not target_draft.get("object") and extracted.get("object") and extracted.get("object") != "obligation":
+                    target_draft["object"] = extracted["object"]
+                    updated_any = True
+                if not target_draft.get("action") and extracted.get("action") and extracted.get("action") != "obligation":
+                    target_draft["action"] = extracted["action"]
+                    updated_any = True
+            
+            if updated_any:
                 self.storage.reset_low_signal_count(conversation_id)
+            else:
+                # 2. Try to validate the expected missing field locally first
+                val_res = validate_field_locally(missing_field, normalized_text, target_draft.get("type"))
+                if val_res["valid"]:
+                    self.storage.reset_low_signal_count(conversation_id)
+                    val = val_res["value"]
+                    if missing_field == "amount":
+                        target_draft["amount_cents"] = val["amount_cents"]
+                        target_draft["currency"] = val["currency"]
+                    elif missing_field == "deadline":
+                        target_draft["deadline_utc"] = val["deadline_utc"]
+                        target_draft["deadline_raw"] = val["deadline_raw"]
+                    else:
+                        target_draft[missing_field] = val
+                    metrics.increment("field_values_resolved_deterministically")
+                else:
+                    metrics.increment("validation_attempts")
+                    # 3. Fall back to LLM validation
+                    val_res = validate_field_via_llm(missing_field, target_draft.get("type"), normalized_text)
+                    if val_res["valid"]:
+                        self.storage.reset_low_signal_count(conversation_id)
+                        val = val_res["value"]
+                        if missing_field == "amount":
+                            target_draft["amount_cents"] = val["amount_cents"]
+                            target_draft["currency"] = val["currency"]
+                        elif missing_field == "deadline":
+                            target_draft["deadline_utc"] = val["deadline_utc"]
+                            target_draft["deadline_raw"] = val["deadline_raw"]
+                        else:
+                            target_draft[missing_field] = val
+                    else:
+                        metrics.increment("invalid_responses")
+                        metrics.increment("clarification_requests")
+                        is_unrelated = (not normalized_text) or (text.lower().strip() in ("thanks", "thank you", "ok", "okay", "yes", "no", "hi", "hello"))
+                        if is_unrelated:
+                            return get_unrelated_clarification(missing_field, target_draft)
+                        else:
+                            return get_invalid_clarification(missing_field, normalized_text, target_draft)
 
             # Recheck missing fields
-            next_missing = find_missing_required_field(draft)
+            next_missing = find_missing_required_field(target_draft)
             if next_missing:
-                draft["missing_field"] = next_missing
-                self.storage.save_draft(draft)
-                return get_clarification_question(next_missing, draft)
+                target_draft["missing_field"] = next_missing
+                self.storage.save_draft(target_draft)
+                metrics.increment("clarification_requests")
+                
+                if channel == "email":
+                    all_missing_fields = []
+                    for f in ["party", "amount", "deadline", "object", "action"]:
+                        temp = target_draft.copy()
+                        if f == "amount" and temp.get("amount_cents") is None:
+                            all_missing_fields.append("amount")
+                        elif f == "deadline" and not temp.get("deadline_utc") and temp.get("type") != "approval":
+                            all_missing_fields.append("deadline")
+                        elif f == "party" and (not temp.get("party") or temp.get("party") == "Counterparty"):
+                            all_missing_fields.append("party")
+                        elif f == "object" and not temp.get("object") and temp.get("type") in ("delivery", "document", "service"):
+                            all_missing_fields.append("object")
+                    return format_email_body(all_missing_fields or [next_missing], target_draft.get("type"))
+                else:
+                    filled_part = ""
+                    if missing_field == "amount" and target_draft.get("amount_cents") is not None:
+                        filled_part = f"Thanks. I have {format_amount(target_draft['amount_cents'])}. "
+                    elif missing_field == "deadline" and target_draft.get("deadline_raw"):
+                        filled_part = f"Thanks. I have the deadline as {target_draft['deadline_raw']}. "
+                    return (filled_part + get_clarification_question(next_missing, target_draft)).strip()
             else:
-                self.storage.delete_draft(conversation_id)
+                self.storage.delete_draft(target_draft["draft_id"])
                 self.storage.mark_onboarding_sent(conversation_id)
                 self.storage.reset_low_signal_count(conversation_id)
                 
                 import uuid
                 c_id = f"commitment_{uuid.uuid4().hex[:6]}"
                 
-                d_utc_str = draft["deadline_utc"]
+                d_utc_str = target_draft["deadline_utc"]
                 if d_utc_str.endswith('Z'):
                     d_utc_str = d_utc_str[:-1] + '+00:00'
                 deadline_utc = datetime.datetime.fromisoformat(d_utc_str)
@@ -406,16 +524,16 @@ class BizPulseService:
                 new_commitment = Commitment(
                     id=c_id,
                     conversation_id=conversation_id,
-                    party=draft["party"],
-                    organization=draft["organization"],
-                    type=draft["type"],
-                    action=draft["action"] or "promise",
-                    object=draft["object"],
-                    amount_cents=draft["amount_cents"],
-                    residual_cents=draft["amount_cents"],
-                    currency=draft["currency"] or "INR",
+                    party=target_draft["party"],
+                    organization=target_draft["organization"],
+                    type=target_draft["type"],
+                    action=target_draft["action"] or "promise",
+                    object=target_draft["object"],
+                    amount_cents=target_draft["amount_cents"],
+                    residual_cents=target_draft["amount_cents"],
+                    currency=target_draft["currency"] or "INR",
                     deadline_utc=deadline_utc,
-                    deadline_raw=draft["deadline_raw"],
+                    deadline_raw=target_draft["deadline_raw"],
                     timezone=DEFAULT_TIMEZONE,
                     status="pending",
                     source_message_id=message_id,
@@ -424,7 +542,7 @@ class BizPulseService:
                     notes=None,
                     created_at=datetime.datetime.now(datetime.timezone.utc),
                     updated_at=datetime.datetime.now(datetime.timezone.utc),
-                    extraction_method=draft.get("extraction_method") or "offline"
+                    extraction_method=target_draft.get("extraction_method") or "offline"
                 )
                 
                 self.storage.save_commitment(new_commitment)
@@ -442,18 +560,10 @@ class BizPulseService:
                 deadline_str = new_commitment.deadline_raw or new_commitment.deadline_utc.strftime("%Y-%m-%d")
                 
                 if new_commitment.type == "payment":
-                    resp = (
-                        f"Got it 👍\n\n"
-                        f"{new_commitment.party} is supposed to pay {amount_str} by {deadline_str}.\n\n"
-                        f"I'll start tracking this for you."
-                    )
+                    resp = f"Got it. I'm tracking {amount_str} from {new_commitment.party}, due {deadline_str}."
                 else:
                     action_verb = new_commitment.action or "deliver"
-                    resp = (
-                        f"Got it 👍\n\n"
-                        f"{new_commitment.party} is supposed to {action_verb} {new_commitment.object} by {deadline_str}.\n\n"
-                        f"I'll start tracking this for you."
-                    )
+                    resp = f"Got it 👍\n\n{new_commitment.party} is supposed to {action_verb} {new_commitment.object} by {deadline_str}.\n\nI'll start tracking this for you."
                     
                 unresolved_list = self.storage.get_unresolved_commitments(conversation_id)
                 if len(unresolved_list) == 1:
@@ -475,10 +585,10 @@ class BizPulseService:
                 self.storage.mark_onboarding_sent(conversation_id)
                 metrics.increment("onboarding_messages")
                 return (
-                    "👋 Hi! I'm BizPulse.\n\n"
-                    "I help keep track of business promises so they don't get forgotten.\n\n"
-                    "You can simply tell me something like:\n"
-                    "'Arjun will pay ₹42,000 by Friday.'"
+                    "Hi! I'm BizPulse. I help track business commitments from conversations.\n\n"
+                    "For example:\n"
+                    "'Arjun will pay ₹42,000 by Friday.'\n\n"
+                    "I'll ask if I need any missing details."
                 )
             if not gate_res["passed"]:
                 metrics.increment("messages_filtered")
@@ -507,26 +617,11 @@ class BizPulseService:
             if low_signal_count == 1:
                 metrics.increment("clarification_responses")
                 if topic == "payment":
-                    return (
-                        "I can help track payments 👍\n\n"
-                        "For example:\n"
-                        "'Arjun will pay ₹42,000 by Friday.'\n\n"
-                        "Who is expected to pay, how much, and by when?"
-                    )
+                    return "Sure. Are you trying to track a payment commitment or check an existing payment?"
                 elif topic == "delivery":
-                    return (
-                        "I can track a delivery 👍\n\n"
-                        "Tell me who is delivering it, what they're delivering, and by when."
-                    )
+                    return "Sure. Are you trying to track a delivery commitment or check an existing delivery?"
                 elif topic == "document":
-                    return (
-                        "I can track document commitments 👍\n\n"
-                        "Tell me who needs to send the document and when it's expected."
-                    )
-                elif topic == "followup":
-                    return (
-                        "Sure. Tell me who you're waiting on, what they're supposed to do, and when you expected it."
-                    )
+                    return "Sure. Are you trying to track a document commitment or check an existing document?"
                 else:
                     return (
                         "I can help keep track of business promises like payments, deliveries, and documents.\n\n"
@@ -548,24 +643,28 @@ class BizPulseService:
                 intent = classify_low_signal_intent(normalized_text, minimal_context)
                 logger.info("Recovery LLM classified intent: %s", intent)
                 
-                if intent == "commitment":
+                if intent == "create_commitment":
                     # Let it fall through to Stage 4 (Extraction)
                     pass
-                elif intent == "field_value":
-                    if self.storage.get_draft(conversation_id):
-                        return self.handle_user_message(conversation_id, sender, text, message_id, channel, subject)
-                    else:
-                        return "Understood. Let me know if you have any business commitments or payments to track!"
+                elif intent == "answer_pending_question":
+                    return "Understood. Let me know if you have any business commitments or payments to track!"
+                elif intent == "list_commitments":
+                    unresolved = self.storage.get_unresolved_commitments(conversation_id)
+                    if not unresolved:
+                        return "📋 No active commitments found in this conversation."
+                    lines = ["📋 **Unresolved Commitments:**"]
+                    for c in unresolved:
+                        amt_suffix = f" ({format_amount(c.amount_cents)})" if c.amount_cents else ""
+                        obj_suffix = f" ({c.object})" if (c.object and c.type != "payment") else ""
+                        deadline_str = c.deadline_raw or c.deadline_utc.strftime("%Y-%m-%d")
+                        lines.append(f"• **[{c.id.replace('commitment_', '')}] {c.type.capitalize()}**{amt_suffix}{obj_suffix}\n  {c.party}\n  Due: {deadline_str} ({c.status})")
+                    return "\n".join(lines)
                 elif intent == "help":
                     return (
                         "I'm BizPulse, your conversational assistant to track payments, deliveries, and document commitments.\n\n"
                         "You can tell me what was promised (e.g., 'Arjun will pay ₹42,000 by Friday'), and I'll keep track of deadlines and send follow-ups if they're overdue."
                     )
-                elif intent == "update" and unresolved:
-                    # Let it fall through to Stage 4 (Extraction)
-                    pass
                 else:
-                    # casual / irrelevant
                     return "Understood. Let me know if you have any business commitments or payments to track!"
 
         # Stage 4: Extraction
@@ -584,7 +683,31 @@ class BizPulseService:
         if extracted.get("intent") == "new":
             missing_field = find_missing_required_field(extracted)
             if missing_field:
+                all_missing_fields = []
+                c_type = extracted.get("type") or "other"
+                if c_type == "payment":
+                    if extracted.get("amount_cents") is None:
+                        all_missing_fields.append("amount")
+                    if not extracted.get("deadline_utc"):
+                        all_missing_fields.append("deadline")
+                elif c_type in ("delivery", "document"):
+                    if not extracted.get("object"):
+                        all_missing_fields.append("object")
+                    if not extracted.get("deadline_utc"):
+                        all_missing_fields.append("deadline")
+                elif c_type == "service":
+                    if not extracted.get("object") and not extracted.get("action"):
+                        all_missing_fields.append("object")
+                    if not extracted.get("deadline_utc"):
+                        all_missing_fields.append("deadline")
+                
+                if not extracted.get("party") or extracted.get("party") == "Counterparty":
+                    all_missing_fields.insert(0, "party")
+                
+                import uuid
+                d_id = f"draft_{uuid.uuid4().hex[:6]}"
                 draft = {
+                    "draft_id": d_id,
                     "conversation_id": conversation_id,
                     "party": extracted.get("party"),
                     "organization": extracted.get("organization"),
@@ -604,6 +727,18 @@ class BizPulseService:
                 }
                 self.storage.save_draft(draft)
                 self.storage.mark_onboarding_sent(conversation_id)
+                metrics.increment("incomplete_commitments")
+                
+                if channel == "email":
+                    return format_email_body(all_missing_fields or [missing_field], c_type)
+                
+                if len(all_missing_fields) > 1:
+                    if c_type == "payment":
+                        return "What amount should I record, and when is the payment expected?"
+                    else:
+                        bullets = "\n".join(f"• {f}" for f in all_missing_fields)
+                        return f"I still need:\n{bullets}\n\nYou can provide them together or one at a time."
+                
                 return get_clarification_question(missing_field, draft)
         else:
             validation_status = validate_extraction(extracted)

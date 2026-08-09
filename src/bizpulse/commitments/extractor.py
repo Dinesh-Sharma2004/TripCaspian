@@ -34,7 +34,7 @@ def _parseable_utc(val: str) -> bool:
 def extract_amount_from_text(lower_text: str) -> tuple[int | None, str | None]:
     """Helper to robustly parse monetary amounts from text."""
     # 1. Standard patterns (currency symbol prefix)
-    money_prefix_match = re.search(r'\b(?:₹|rs\.?|inr|usd|\$)\s*([0-9,]+)\b', lower_text)
+    money_prefix_match = re.search(r'(?:^|\s|\b)(?:₹|rs\.?|inr|usd|\$)\s*([0-9,]+)\b', lower_text)
     if money_prefix_match:
         val = int(money_prefix_match.group(1).replace(",", ""))
         currency = "INR" if any(c in lower_text for c in ["₹", "rs", "inr"]) else "USD"
@@ -182,28 +182,53 @@ def extract_offline(text: str, now_utc: datetime.datetime, tz_name: str) -> dict
     # 4. New commitment extraction (e.g. Arjun from Delta Traders says...)
     amount_cents, currency = extract_amount_from_text(lower_text)
     has_date = any(day in lower_text for day in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "tomorrow", "next week"])
-    if (amount_cents is not None) or has_date:
+    
+    # Verb + obligation/party clues to support incomplete commitments
+    has_verb = any(v in lower_text for v in ["pay", "deliver", "send", "provide", "submit", "approve", "confirm", "perform", "do"])
+    has_obligation = any(o in lower_text for o in ["will", "shall", "promised", "agreed", "committed", "owe", "due", "supposed to"])
+    has_party = any(p in lower_text for p in ["arjun", "supplier", "vendor", "customer", "client"])
+    is_create_intent = has_verb and (has_obligation or has_party)
+    
+    if (amount_cents is not None) or has_date or is_create_intent:
         res["has_commitment"] = True
         res["intent"] = "new"
         
-        # Check document clues
-        doc_match = re.search(r'\b(send|provide)\s+(.*?)\s+(?:friday|monday|tuesday|wednesday|thursday|saturday|sunday|tomorrow|next week|today|by)', lower_text)
-        if doc_match:
+        # Classify commitment type
+        if "pay" in lower_text:
+            res["type"] = "payment"
+            res["action"] = "pay"
+            res["object"] = "money"
+        elif "deliver" in lower_text or "delivery" in lower_text:
+            res["type"] = "delivery"
+            res["action"] = "deliver"
+            obj_match = re.search(r'\bdeliver\s+(.*?)\s+(?:friday|monday|tuesday|wednesday|thursday|saturday|sunday|tomorrow|next week|today|by)', lower_text)
+            if obj_match:
+                res["object"] = obj_match.group(1).strip()
+            else:
+                obj_fallback = re.search(r'\b(?:deliver|deliveries)\s+(.*?)$', lower_text)
+                res["object"] = obj_fallback.group(1).strip().rstrip(".") if obj_fallback else "goods"
+        elif any(w in lower_text for w in ["send", "provide", "submit"]):
             res["type"] = "document"
             res["action"] = "send"
-            res["object"] = doc_match.group(2).strip()
-        else:
-            res["type"] = "payment" if (amount_cents is not None or "pay" in lower_text) else "delivery"
-            res["action"] = "pay" if res["type"] == "payment" else "deliver"
-            if res["type"] == "payment":
-                res["object"] = "money"
+            doc_match = re.search(r'\b(?:send|provide|submit)\s+(.*?)\s+(?:friday|monday|tuesday|wednesday|thursday|saturday|sunday|tomorrow|next week|today|by)', lower_text)
+            if doc_match:
+                res["object"] = doc_match.group(1).strip()
             else:
-                # Extract object for delivery
-                obj_match = re.search(r'\bdeliver\s+(.*?)\s+(?:friday|monday|tuesday|wednesday|thursday|saturday|sunday|tomorrow|next week|today|by)', lower_text)
-                if obj_match:
-                    res["object"] = obj_match.group(1).strip()
-                else:
-                    res["object"] = "goods"
+                doc_fallback = re.search(r'\b(?:send|provide|submit)\s+(.*?)$', lower_text)
+                res["object"] = doc_fallback.group(1).strip().rstrip(".") if doc_fallback else "document"
+        elif any(w in lower_text for w in ["perform", "do"]):
+            res["type"] = "service"
+            res["action"] = "perform"
+            svc_match = re.search(r'\b(?:perform|do)\s+(.*?)\s+(?:friday|monday|tuesday|wednesday|thursday|saturday|sunday|tomorrow|next week|today|by)', lower_text)
+            if svc_match:
+                res["object"] = svc_match.group(1).strip()
+            else:
+                svc_fallback = re.search(r'\b(?:perform|do)\s+(.*?)$', lower_text)
+                res["object"] = svc_fallback.group(1).strip().rstrip(".") if svc_fallback else "service"
+        else:
+            res["type"] = "other"
+            res["action"] = "obligation"
+            res["object"] = "obligation"
         
         if amount_cents is not None:
             res["amount_cents"] = amount_cents
@@ -399,23 +424,25 @@ def classify_low_signal_intent(text: str, minimal_context: str = "") -> str:
     """Compact LLM call to classify the user's intent on low-signal input."""
     import bizpulse.metrics as metrics
     if not GEMINI_API_KEY:
-        return "casual"
+        return "unrelated"
         
     system_prompt = """You classify ambiguous user messages for a business commitment assistant.
 Return JSON only:
 {
-  "intent": "commitment" | "field_value" | "update" | "help" | "casual" | "irrelevant"
+  "intent": "create_commitment" | "answer_pending_question" | "list_commitments" | "reschedule" | "fulfillment" | "dispute" | "help" | "unrelated"
 }
 
 Rules:
-- commitment = user appears to describe an obligation
-- field_value = likely answer to a currently requested field
-- update = user changes an existing commitment
-- help = user asks how to use the assistant
-- casual = normal conversation
-- irrelevant = unrelated
+- create_commitment = user describes a promise, obligation, or commitment they want to track
+- answer_pending_question = user provides details (amounts, dates, names) answering a question
+- list_commitments = user wants to see current/active commitments
+- reschedule = user wants to change a deadline/date
+- fulfillment = user claims they fulfilled or sent something
+- dispute = user disputes or disagrees with a commitment
+- help = user asks what the bot does or how to use it
+- unrelated = normal casual conversation or completely irrelevant chatter
 
-Do not extract the full commitment here."""
+Do not extract any details here."""
 
     headers = {"Content-Type": "application/json"}
     body = {
@@ -446,10 +473,10 @@ Do not extract the full commitment here."""
         import json
         data = json.loads(raw_output)
         intent = data.get("intent")
-        if intent in ("commitment", "field_value", "update", "help", "casual", "irrelevant"):
+        if intent in ("create_commitment", "answer_pending_question", "list_commitments", "reschedule", "fulfillment", "dispute", "help", "unrelated"):
             return intent
-        return "casual"
+        return "unrelated"
     except Exception as e:
         metrics.increment("api_errors")
         logger.warning("Low-signal classification failed: %s", e)
-        return "casual"
+        return "unrelated"
