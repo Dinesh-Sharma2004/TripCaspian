@@ -46,9 +46,17 @@ class handler(BaseHTTPRequestHandler):
             "status": "online",
             "service": "TripCaspian AI Agent",
             "version": "0.1.0",
-            "telegram_bot": "@tripiss_bot",
+            "telegram": {
+                "bot": "@tripiss_bot"
+            },
+            "discord": {
+                "server": "https://discord.gg/jaHVFaUmr",
+                "channel":"bizpulse-test"
+            },
+            "email": {
+                "address": "bizpulse@agents.trycaspianai.com"
+            },
             "channels": ["telegram", "discord", "email"],
-            "providers": ["IRCTC Train", "redBus Bus", "Uber Cab"],
         }
         self.wfile.write(json.dumps(response, indent=2).encode("utf-8"))
 
