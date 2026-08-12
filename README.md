@@ -1,4 +1,4 @@
-# BizPulse 💼 — Business Commitment & Obligation Agent
+# BizPulse  — Business Commitment & Obligation Agent
 
 > **Built for the Caspian Hackathon Submission**
 > Reachable via **Telegram** and **Email** using a single unified `on_message` and `on_interaction` handler powered by [Caspian SDK](https://github.com/TryCaspian/caspian-sdk).
@@ -13,6 +13,8 @@ In daily business operations, promises and commitments are frequently made durin
 * *"I'll send the GST certificate tomorrow."*
 
 These obligations often get buried in chat histories, email threads, or messaging channels, requiring manual follow-ups, calendars, or spreadsheet trackers. **BizPulse** solves this by converting natural language commitments directly into structured business obligations, tracking their lifecycle deterministically, and proactively alerting the relevant parties when action is required.
+
+And one more emphasize to decrease LLM calls by using rule based approach first, in case if user can't provide details in 2 retries, we will go for LLM for NLU.
 
 ---
 
